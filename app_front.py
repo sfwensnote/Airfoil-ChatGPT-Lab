@@ -1279,3 +1279,4 @@ with col_main:
                     st.error(f"⚠️ Error fetching airfoils: {e}")
         else:
             st.warning("Enter the correct admin password to access this panel.")
+
