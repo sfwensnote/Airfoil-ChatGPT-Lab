@@ -1,0 +1,22 @@
+# 基础依赖
+fastapi==0.112.2
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+sqlalchemy==2.0.34
+pandas==2.2.2
+matplotlib==3.9.0
+numpy==1.26.4
+requests==2.32.3
+
+# LangChain + LangGraph
+langchain-openai==0.2.2
+langgraph>=0.2.0
+langgraph-checkpoint>=2.0.0
+langgraph-checkpoint-sqlite>=2.0.0
+langchain-core==0.3.6
+
+# Streamlit 前端
+streamlit==1.36.0
+
+# XFOIL Python 封装（可选，不一定稳定）
+xfoil==1.3.3
