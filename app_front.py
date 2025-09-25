@@ -281,6 +281,32 @@ for r in roles:
     graph.add_edge(r, END)
 
 app = graph.compile()
+# >>> PATCH: LLM retry helper (place right after `app = graph.compile()`)
+import time as _t
+
+def call_llm_with_retries(state: dict, retries: int = 3, base_delay: float = 2.0) -> str:
+    """
+    Call the LangGraph app with simple exponential backoff.
+    Returns the LLM text or "" if all attempts failed or empty.
+    """
+    last_err = None
+    for k in range(retries):
+        try:
+            resp_state = app.invoke(state)
+            txt = (resp_state or {}).get("content", "")
+            if isinstance(txt, str) and txt.strip():
+                return txt.strip()
+        except Exception as e:
+            last_err = e
+        # backoff: 2s, 4s, 8s ...
+        _t.sleep(base_delay * (2 ** k))
+    # all failed or got empty content
+    if last_err:
+        # 让调用方决定是否展示错误/落盘
+        # 不抛出异常，返回空串以走统一兜底提示
+        pass
+    return ""
+
 
 
 # =========================
@@ -323,31 +349,65 @@ def estimate_Re(rho: float, V: float, chord: float, mu: float) -> float:
 # —— Streamlit UI ——
 # =====================
 st.set_page_config(page_title="Fluid Mechanics AI Assistant", layout="wide")
-st.title("")
 
+# --- 合并且加固的样式（只保留这一个 <style>） ---
 st.markdown("""
 <style>
-/* 让主容器更贴边，减少上下空白 */
-.block-container { padding-top: 0.6rem; padding-bottom: 0.6rem; }
+/* 1) 让主容器顶部有充足留白，避免被固定头部覆盖 */
+.block-container {
+    padding-top: 2.0rem !important;   /* 建议 ≥1.6rem；若仍被遮挡，调到 2.4rem */
+    padding-bottom: 0.8rem !important;
+    overflow: visible !important;      /* 防止被裁切 */
+}
 
-/* 右侧面板做成上下两段的感觉（通过控制内边距和间距实现“上半预览、下半参数”） */
-.right-top-title { margin: 0.2rem 0 0.2rem 0; }
-.right-bottom-title { margin: 0.4rem 0 0.2rem 0; }
+/* 2) 保证标题本身不被挤；行高充足、外边距合理 */
+h1 {
+    margin: 0 0 .6rem 0 !important;
+    line-height: 1.18 !important;
+    word-break: break-word;
+}
 
-/* 参数区整体更紧凑：减少控件之间的留白与标签字号 */
-div[data-testid="stSlider"], div[data-testid="stNumberInput"] { margin-bottom: 0.35rem; }
-label, .st-emotion-cache-1y4p8pa, .st-emotion-cache-1vbkxwb { font-size: 0.85rem !important; }
+/* 3) 有些项目里会给 header/容器设置 overflow:hidden，这里强制解除 */
+header, [data-testid="stHeader"] {
+    overflow: visible !important;
+}
 
-/* 让小标题更小 */
-h3, h4, h5 { margin: 0.2rem 0 0.2rem 0 !important; }
+/* 4) 次级标题更紧凑（可选） */
+h3, h4, h5 { margin: .2rem 0 .2rem 0 !important; }
 
-/* 让参数区的列更紧密点 */
-.compact-col > div { padding-right: 0.4rem; }
+/* 5) 不要用会变动的情绪类名，以下仅对常用控件轻量收紧（可选） */
+div[data-testid="stSlider"], div[data-testid="stNumberInput"] { margin-bottom: .35rem; }
 
-/* 聊天 iframe 旁的输入行挤一点 */
-.input-row { margin-top: 0.4rem; }
+/* 6) 右侧输入行微调（可选） */
+.input-row { margin-top: .4rem; }
+
 </style>
 """, unsafe_allow_html=True)
+st.markdown("""
+<style>
+/* Top-anchored, no vertical blank area for matplotlib images/canvas */
+.fixed-plot {
+  height: 320px;                /* 你也可以改成 300/340；固定高度，避免跳动 */
+  position: relative;
+  overflow: hidden;
+}
+
+/* 让图片/画布铺满容器，高度优先，保持等比，不再居中 */
+.fixed-plot img, .fixed-plot canvas {
+  position: absolute;
+  inset: 0;                     /* top:0 right:0 bottom:0 left:0 */
+  width: 100%;
+  height: 100%;
+  object-fit: contain;          /* 保持等比 */
+  object-position: top left;    /* 顶对齐（也可用 'top center'）*/
+  display: block;               /* 去掉 inline 元素造成的垂直对齐影响 */
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+st.title("AI-Enhanced Airfoil Design & Learning Lab")
+st.caption("An AI-powered airfoil design assistant for NACA geometry preview, XFOIL polar analysis, and role-based learning guidance.")
 
 # ==== Sidebar: User / Admin Login ====
 st.sidebar.title("Login")
@@ -455,7 +515,7 @@ with col_chat:
         """,
         unsafe_allow_html=True,
     )
-    
+
     # === 恢复历史按钮 ===
     if st.button("📜 Restore historical dialogue", use_container_width=True):
         try:
@@ -651,16 +711,34 @@ with col_chat:
             st.caption("🔎 No hits")
 
 
-    # === 安全转义 + 高亮函数 ===
-    def _escape(s: str) -> str:
-        return html.escape(s, quote=False)
+    # ===== Markdown rendering (server-side) =====
+    def render_markdown_to_html(md_text: str) -> str:
+        """Render Markdown to safe HTML. Falls back to a minimal converter if libs are missing."""
+        try:
+            import markdown as md
+            html_out = md.markdown(md_text, extensions=["fenced_code", "tables", "toc", "sane_lists"])
+            try:
+                import bleach
+                allowed = bleach.sanitizer.ALLOWED_TAGS.union(
+                    {"p", "pre", "code", "table", "thead", "tbody", "tr", "th", "td", "hr",
+                     "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li", "blockquote"}
+                )
+                return bleach.clean(html_out, tags=allowed, strip=True)
+            except Exception:
+                return html_out
+        except Exception:
+            # minimal fallback: keep bold / code / line breaks
+            s = html.escape(md_text, quote=False)
+            s = s.replace("**", "<b>").replace("`", "<code>")
+            return s.replace("\n", "<br>")
 
 
-    def _hilite_safe(text: str, q: str) -> str:
+    def highlight_after_rendered(html_text: str, q: str) -> str:
         if not q:
-            return _escape(text)
-        pattern = re.compile(re.escape(q), flags=re.IGNORECASE)
-        return pattern.sub(lambda m: f"<mark>{_escape(m.group(0))}</mark>", _escape(text))
+            return html_text
+        # highlight matched query segments
+        return re.sub(re.escape(q), lambda m: f"<mark>{html.escape(m.group(0))}</mark>",
+                      html_text, flags=re.IGNORECASE)
 
 
     # === 渲染聊天（组件版：iframe 内完全可控） ===
@@ -668,7 +746,9 @@ with col_chat:
     for i, msg in enumerate(messages):
         if i not in display_indices:
             continue
-        content_html = _hilite_safe(str(msg.get("content", "")), q)
+        raw = str(msg.get("content", ""))
+        rendered = render_markdown_to_html(raw)  # Markdown → safe HTML
+        content_html = highlight_after_rendered(rendered, q)  # 可选高亮
         if msg["role"] == "user":
             inner_html += f"<div class='bubble user-bubble' id='msg-{i}'>👤 You ({user_id})<br>{content_html}</div>"
         elif msg["role"] == "ai":
@@ -737,82 +817,123 @@ with col_chat:
           transition: outline 1.2s ease-in-out;
       }}
       mark {{ padding: 0 2px; }}
+      /* code/table styling for rendered Markdown */
+  pre, code {{
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.5px;
+  }}
+  pre {{
+    background: #f7f7f9;
+    padding: 8px 10px;
+    border-radius: 6px;
+    overflow: auto;
+  }}
+  table {{ border-collapse: collapse; max-width: 100%; }}
+  th, td {{ border: 1px solid #e5e7eb; padding: 4px 8px; font-size: 13px; }}
+  blockquote {{ border-left: 3px solid #e5e7eb; margin: 6px 0; padding: 4px 8px; color:#444; }}
+ 
     </style>
     </head>
     <body>
       <div class="chat-wrapper" id="chat-box">{inner_html}</div>
 
-    <script>
-    (function() {{
-      const chatBox = document.getElementById('chat-box');
-      if (!chatBox) return;
+  <script>
+(function() {{
+  const chatBox = document.getElementById('chat-box');
+  if (!chatBox) return;
 
-      const FORCE = {str(_force).lower()};
-      const TARGET = {json.dumps(target_id)};
-      const STORAGE_KEY = "autoFollow:{html.escape(user_id)}";
+  // Python → JS 注入（保持不变）
+  const FORCE  = {str(_force).lower()};
+  const TARGET = {json.dumps(target_id)};
 
-      function getAutoFollow() {{
-        const v = localStorage.getItem(STORAGE_KEY);
-        return (v === null) ? true : v === "1";
+  // 使用 user_id 构造本地存储键；避免使用模板字符串以防 f-string 解析
+  const STORAGE_KEY = "autoFollow:" + {json.dumps(user_id)};
+  const SCROLL_KEY  = "scrollTop:"  + {json.dumps(user_id)};
+
+  // --- auto-follow state (persisted via localStorage) ---
+  function getAutoFollow() {{
+    const v = localStorage.getItem(STORAGE_KEY);
+    return (v === null) ? true : v === "1";
+  }}
+  function setAutoFollow(on) {{
+    localStorage.setItem(STORAGE_KEY, on ? "1" : "0");
+  }}
+
+  // --- scrollTop persistence (sessionStorage) ---
+  function saveScroll() {{
+    try {{
+      sessionStorage.setItem(SCROLL_KEY, String(chatBox.scrollTop));
+    }} catch (e) {{}}
+  }}
+  function restoreScroll() {{
+    try {{
+      const v = sessionStorage.getItem(SCROLL_KEY);
+      if (v !== null) {{
+        const n = parseInt(v, 10);
+        if (!Number.isNaN(n)) chatBox.scrollTop = n;
       }}
-      function setAutoFollow(on) {{
-        localStorage.setItem(STORAGE_KEY, on ? "1" : "0");
-      }}
+    }} catch (e) {{}}
+  }}
 
-      function isAtBottom() {{
-        const threshold = 40; // px
-        return chatBox.scrollTop + chatBox.clientHeight >= chatBox.scrollHeight - threshold;
-      }}
-      function scrollToBottom(force) {{
-        if (force || (getAutoFollow() && isAtBottom())) {{
-          chatBox.scrollTop = chatBox.scrollHeight;
-        }}
-      }}
-      function scrollToTarget(id) {{
-        if (!id) return false;
-        const el = document.getElementById(id);
-        if (el) {{
-          el.scrollIntoView({{behavior: 'smooth', block: 'end'}});
-          setAutoFollow(false);
-          el.classList.add("hit-focus");
-          setTimeout(() => el.classList.remove("hit-focus"), 1200);
-          return true;
-        }}
-        return false;
-      }}
+  function isAtBottom() {{
+    return chatBox.scrollTop + chatBox.clientHeight >= chatBox.scrollHeight - 40;
+  }}
+  function scrollToBottom(force) {{
+    if (force || (getAutoFollow() && isAtBottom())) {{
+      chatBox.scrollTop = chatBox.scrollHeight;
+    }}
+  }}
+  function scrollToTarget(id) {{
+    if (!id) return false;
+    const el = document.getElementById(id);
+    if (el) {{
+      el.scrollIntoView({{ behavior: 'smooth', block: 'end' }});
+      setAutoFollow(false);
+      el.classList.add("hit-focus");
+      setTimeout(() => el.classList.remove("hit-focus"), 1200);
+      return true;
+    }}
+    return false;
+  }}
 
-      // 初次渲染：优先定位命中；否则按 FORCE/是否在底部决定
-      requestAnimationFrame(() => setTimeout(() => {{
-        if (!scrollToTarget(TARGET)) {{
-          if (FORCE) setAutoFollow(true);
-          scrollToBottom(FORCE);
-        }}
-      }}, 0));
+  // Initial mount: prefer TARGET; else restore; apply FORCE if requested
+  requestAnimationFrame(() => setTimeout(() => {{
+    if (!scrollToTarget(TARGET)) {{
+      if (!FORCE) restoreScroll();
+      if (FORCE) setAutoFollow(true);
+      scrollToBottom(FORCE);
+    }}
+  }}, 0));
 
-      // 监听内容变化：在自动跟随开启时或已在底部时滚到最新
-      const mo = new MutationObserver(() => {{
-        if (getAutoFollow()) {{
-          chatBox.scrollTop = chatBox.scrollHeight;
-        }} else if (isAtBottom()) {{
-          setAutoFollow(true);
-        }}
-      }});
-      mo.observe(chatBox, {{ childList: true, subtree: true }});
+  // Auto-follow when new nodes added (unless user scrolled up)
+  const mo = new MutationObserver(() => {{
+    if (getAutoFollow()) {{
+      chatBox.scrollTop = chatBox.scrollHeight;
+    }} else if (isAtBottom()) {{
+      setAutoFollow(true);
+    }}
+  }});
+  mo.observe(chatBox, {{ childList: true, subtree: true }});
 
-      // 用户滚动：上拉 → 关闭跟随；到底 → 开启跟随
-      let lastTop = chatBox.scrollTop;
-      chatBox.addEventListener('scroll', () => {{
-        const nowTop = chatBox.scrollTop;
-        const delta = nowTop - lastTop;
-        lastTop = nowTop;
-        if (delta < -10) {{
-          setAutoFollow(false);
-        }} else if (isAtBottom()) {{
-          setAutoFollow(true);
-        }}
-      }});
-    }})();
-    </script>
+  // User scroll behavior: scroll up → disable follow; bottom → enable follow
+  let lastTop = chatBox.scrollTop;
+  chatBox.addEventListener('scroll', () => {{
+    saveScroll();
+    const nowTop = chatBox.scrollTop;
+    const delta  = nowTop - lastTop;
+    lastTop = nowTop;
+    if (delta < -10) {{
+      setAutoFollow(false);
+    }} else if (isAtBottom()) {{
+      setAutoFollow(true);
+    }}
+  }});
+
+  // Persist before unload (tab close / refresh)
+  window.addEventListener('beforeunload', saveScroll);
+}})();
+</script>
+
     </body></html>
     """, height=CHAT_HEIGHT + 6, scrolling=False)
 
@@ -822,13 +943,45 @@ with col_chat:
         "Model Iteration": "Assist with simulation and iteration.",
         "Strategy Review": "Review and improve strategies."
     }
+    # --- Concise Mode toggle (EN) ---
+    concise = st.toggle(
+        "✂️ Concise mode (≤6 lines + ≤2 questions)",
+        value=True,
+        help="Limit length and number of probing questions"
+    )
+
+
+    def get_prompt(role):
+        style_guard = (
+            "When replying, ALWAYS follow this structure:\n"
+            "1) Key points (≤4 bullet points)\n"
+            "2) Evidence/Reasoning (≤2 sentences)\n"
+            "3) Next step (≤1 actionable step)\n"
+            "Ask at most 2 short questions.\n"
+        )
+        length_guard = "Hard cap: ≤6 lines total. Avoid meta talk." if concise else "No hard cap. Provide details when useful."
+        sys = f"{roles[role]}\n{style_guard}{length_guard}\nHistorical Dialogue: {{history}}"
+        return ChatPromptTemplate.from_messages([
+            ("system", sys),
+            ("user", "{question}")
+        ])
+
+
     selected_role = st.selectbox(
         "🎭 Choose AI Module",
         list(roles.keys()),
         index=0,
         key="role_select"
     )
-    st.caption(f"ℹ️ {role_help[selected_role]}")
+
+    # ✅ 不再只显示所选模块简介；改为展示所有模块的一行简介
+    st.markdown('<div class="ctl-label">Modules overview</div>', unsafe_allow_html=True)
+    for r in roles:
+        desc = role_descriptions.get(r) or role_help.get(r, "")
+        # 一行、简洁：模块名 + 简短说明
+        st.caption(f"• **{r}** — {desc}")
+
+    # 下面保持原有的切换逻辑（切换角色时滚动到底部）
     if "prev_role" not in st.session_state:
         st.session_state["prev_role"] = selected_role
     if st.session_state["prev_role"] != selected_role:
@@ -958,6 +1111,7 @@ with col_chat:
             st.warning(f"⚠️ Failed to save user message: {str(e)}")
 
         # 3) 调用 LLM（LangGraph）
+        # 3) Call LLM with retries (LangGraph)
         answer = ""
         try:
             history = "\n".join([f"{m['role']}: {m['content']}" for m in st.session_state[chat_key]])
@@ -966,12 +1120,11 @@ with col_chat:
                 "history": history,
                 "question": student_question,
             }
-            response_state = app.invoke(state)
-            # LangGraph 返回的是 state(dict)，节点把文本写在 "content" 里
-            answer = response_state.get("content", "")
+            # use retry helper
+            answer = call_llm_with_retries(state, retries=3, base_delay=2.0)
         except Exception as e:
-            st.error(f"LLM 调用失败：{e}")
-            # 4) 把错误也入库，方便排障
+            st.error(f"LLM call failed: {e}")
+            # 4) also log the error to backend for troubleshooting
             try:
                 requests.post(
                     f"{BACKEND_URL}/save_conversation/",
@@ -986,6 +1139,11 @@ with col_chat:
                 )
             except Exception:
                 pass
+
+        # 可选的用户提示：重试后仍无有效文本
+        if not answer:
+            st.info(
+                "The AI returned no valid content after several attempts. Please retry in a moment or simplify your question.")
 
         # 5) ✅ 把 AI 回复追加到前端会话，并写回后端（你当前缺的就是这一块）
         if answer:
@@ -1017,8 +1175,8 @@ with col_chat:
 
 # ===== Right: Tabs =====
 with col_main:
-    tab_geo, tab_perf, tab_hist, tab_admin = st.tabs([
-        "🧩 Geometry & Parameters", "📈 Performance & Polars", "🗂️ History", "🔑 Admin"
+    tab_geo, tab_perf, tab_hist, tab_help, tab_admin = st.tabs([
+        "🧩 Geometry & Parameters", "📈 Performance & Polars", "🗂️ History", "❓ Help", "🔑 Admin"
     ])
 
     # === Geometry Tab ===
@@ -1043,16 +1201,59 @@ with col_main:
              st.session_state.get("tpos_pct", 30.0) / 100)
 
         xs, ys = gen_naca4(m, p, t)
-        fig, ax = plt.subplots(figsize=(8.2, 4.6))  # 预览更大一点
+        # >>> PATCH: ultra-safe, tighter Airfoil Preview (no tight/constrained/subplots_adjust)
+        fig, ax = plt.subplots(figsize=(9.0, 4.8))  # 稍大画布
+
+        # 主曲线
         ax.plot(xs, ys, linewidth=2)
-        ax.axvline(x=p, linestyle='--', label='Max camber pos')
-        ax.axvline(x=max_t_pos, linestyle=':', label='Max thickness pos')
-        ax.set_aspect('equal', 'box')
-        ax.set_xlabel("x/c");
-        ax.set_ylabel("y/c")
-        ax.set_title(f"NACA {naca_code_from_mpt(m, p, t)}")
-        ax.legend()
-        st.pyplot(fig, use_container_width=True)
+
+        # 安全的竖线（只在 [0,1] 内才画）
+        try:
+            if 0.0 <= float(p) <= 1.0:
+                ax.axvline(x=float(p), linestyle="--", linewidth=1.2, label="Max camber pos")
+            if 0.0 <= float(max_t_pos) <= 1.0:
+                ax.axvline(x=float(max_t_pos), linestyle=":", linewidth=1.2, label="Max thickness pos")
+            ax.legend(loc="upper right", frameon=False, fontsize=10, borderaxespad=0.3, handlelength=2.4)
+        except Exception:
+            pass  # 图例出错直接忽略，不影响主图
+
+        # 轴比例与标签
+        ax.set_aspect("equal", "box")
+        ax.set_xlabel("x/c", labelpad=2)
+        ax.set_ylabel("y/c", labelpad=2)
+        ax.set_title(f"NACA {naca_code_from_mpt(m, p, t)}", pad=4, fontsize=14)
+
+        # —— 只做“安全边界”计算，全面 NaN/空数组保护 —— #
+        mask = np.isfinite(xs) & np.isfinite(ys)
+        if np.count_nonzero(mask) >= 2:
+            xlo = float(np.nanmin(xs[mask]));
+            xhi = float(np.nanmax(xs[mask]))
+            ylo = float(np.nanmin(ys[mask]));
+            yhi = float(np.nanmax(ys[mask]))
+            xr = max(xhi - xlo, 1e-6)
+            yr = max(yhi - ylo, 1e-6)
+            # 横向几乎贴边；纵向保留 ~6%
+            ax.set_xlim(xlo - 0.01 * xr, xhi + 0.01 * xr)
+            ax.set_ylim(ylo - 0.06 * yr, yhi + 0.06 * yr)
+        else:
+            # 极端情况下给个保底边界
+            ax.set_xlim(-0.01, 1.01)
+            ax.set_ylim(-0.2, 0.2)
+
+        # 去掉多余脊线，减少视觉留白
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+        # 关键：用固定轴矩形位置“手动紧凑”，避免与任何自动布局冲突
+        # [left, bottom, width, height] in figure coordinates (0~1)
+        # 可以再把 bottom/left 稍微变小让图更“满”，但不要 <0.05 以免文字被裁
+        ax.set_position([0.08, 0.16, 0.90, 0.78])
+
+        # 输出（若你有 fixed-plot 容器就保留；没有也可以直接 st.pyplot）
+        with st.container():
+            st.markdown('<div class="fixed-plot">', unsafe_allow_html=True)
+            st.pyplot(fig, use_container_width=True)
+            st.markdown('</div>', unsafe_allow_html=True)
 
         Re = estimate_Re(rho, V, chord, mu)
         st.caption(f"Re ≈ {Re:,.0f} · α={alpha:.1f}° · Ncrit={Ncrit:g} · M={M:g}")
@@ -1061,6 +1262,13 @@ with col_main:
 
         # ===== 下半：紧凑参数区（3×4 的栅格，尽量压缩竖向空间） =====
         st.markdown("### Parameters", help=None)
+        # >>> PATCH: apply pending alpha (must run BEFORE creating the 'alpha_deg' slider anywhere)
+        if "pending_alpha_deg" in st.session_state:
+            try:
+                st.session_state["alpha_deg"] = float(st.session_state.pop("pending_alpha_deg"))
+            except Exception:
+                st.session_state.pop("pending_alpha_deg", None)
+        # >>> END PATCH
 
         # --- 行1：翼型几何（用 4 列）
         g1, g2, g3, g4 = st.columns(4)
@@ -1128,9 +1336,19 @@ with col_main:
         Re = estimate_Re(rho, V, chord, mu)
         df_polar = run_xfoil_polar(naca_code, Re, M, Ncrit, float(a_min), float(a_max), float(a_step))
 
+        # >>> PATCH: handle XFOIL failure (place right after df_polar = ...)
         if df_polar.empty:
-            st.warning("⚠️ No valid polar data. Showing simulated fallback data instead.")
+            st.error(
+                "XFOIL produced no valid polar. Check the α scan range/step, the Reynolds number magnitude, and Ncrit.")
+            if st.button("Apply recommended scan: α = 0–10°, Δα = 0.5°, Re ≈ 3e5, Ncrit ≈ 7",
+                         key="btn_apply_recommended_scan", use_container_width=True):
+                st.session_state["alpha_range"] = (0.0, 10.0)
+                st.session_state["alpha_step"] = 0.5
+                st.rerun()
+
+            st.info("A simulated placeholder curve is shown below (non-physical). Adjust inputs and recompute.")
             df_polar = fallback_fake_polar(float(a_min), float(a_max), float(a_step))
+        # >>> END PATCH
 
         idx_current = int(np.argmin(np.abs(df_polar["alpha"].values - alpha)))
         CL = float(df_polar.loc[idx_current, "CL"])
@@ -1150,14 +1368,52 @@ with col_main:
         k4.metric("α* (best)", f"{alpha_opt:.1f}°")
 
         st.markdown(f"**Summary:** NACA {naca_code} · Re={Re:,.0f} · L/D_max={ld_max:.1f}")
+        # >>> PATCH: current-α explanation + snap button (place right after Summary, BEFORE plotting)
+        st.caption(
+            "Current α is used to read/mark on charts (it does not change the solved polar). To include it, adjust the scan range.")
+        if not df_polar.empty and "alpha" in df_polar:
+            if st.button("Snap current α to nearest grid point", key="btn_snap_alpha", use_container_width=True):
+                alpha_grid = df_polar["alpha"].to_numpy()
+                snapped = float(alpha_grid[np.argmin(np.abs(alpha_grid - alpha))])
+                # write to pending key; let tab_geo apply it BEFORE the slider is created
+                st.session_state["pending_alpha_deg"] = snapped
+                st.rerun()
+        # >>> END PATCH
 
-        fig2, ax2 = plt.subplots(figsize=(8.0, 4.5))
-        ax2.plot(df_valid["alpha"], df_valid["L/D"], linewidth=2)
-        ax2.axvline(alpha_opt, linestyle="--")
-        ax2.set_xlabel("α (deg)")
-        ax2.set_ylabel("L/D")
-        ax2.set_title("L/D vs α")
-        st.pyplot(fig2, use_container_width=True)
+        tab1, tab2, tab3 = st.tabs(["CL vs α", "CD vs α", "L/D vs α"])
+
+
+        def _vline(ax, a_cur):
+            ax.axvline(a_cur, linestyle="--", linewidth=1.2)
+
+
+        with tab1:
+            fig_cl, ax_cl = plt.subplots(figsize=(8.0, 4.2))
+            ax_cl.plot(df_polar["alpha"], df_polar["CL"], linewidth=2)
+            _vline(ax_cl, alpha)
+            ax_cl.set_xlabel("α (deg)");
+            ax_cl.set_ylabel("CL");
+            ax_cl.set_title("CL vs α")
+            st.pyplot(fig_cl, use_container_width=True)
+
+        with tab2:
+            fig_cd, ax_cd = plt.subplots(figsize=(8.0, 4.2))
+            ax_cd.plot(df_polar["alpha"], df_polar["CD"], linewidth=2)
+            _vline(ax_cd, alpha)
+            ax_cd.set_xlabel("α (deg)");
+            ax_cd.set_ylabel("CD");
+            ax_cd.set_title("CD vs α")
+            st.pyplot(fig_cd, use_container_width=True)
+
+        with tab3:
+            fig2, ax2 = plt.subplots(figsize=(8.0, 4.2))
+            ax2.plot(df_valid["alpha"], df_valid["L/D"], linewidth=2)
+            _vline(ax2, alpha);
+            _vline(ax2, alpha_opt)
+            ax2.set_xlabel("α (deg)");
+            ax2.set_ylabel("L/D");
+            ax2.set_title("L/D vs α (with α* marker)")
+            st.pyplot(fig2, use_container_width=True)
 
         # === Save Button ===
         if st.button("💾 Save this result", use_container_width=True):
@@ -1235,6 +1491,103 @@ with col_main:
                 mime="text/csv",
                 use_container_width=True
             )
+        # === Help Tab ===
+        with tab_help:
+            st.markdown("## Help Center")
+            st.caption("AI-Enhanced Airfoil Design & Learning Lab — Quick reference and troubleshooting")
+
+            st.markdown("### Overview")
+            st.markdown("""
+        This web app is an **AI-assisted airfoil design and learning environment** combining:  
+        1) **Geometry preview & parameter controls** (NACA 4-digit),  
+        2) **XFOIL polar analysis** (CL/CD/CM and L/D), and  
+        3) **Role-based tutoring** for concept learning, model iteration, and strategy review.
+        """)
+
+            st.markdown("### Quick Start")
+            st.markdown("""
+        1. **Set parameters** in **Geometry & Parameters** (camber `m%`, max camber position `p%`, thickness `t%`, flow & solver settings).  
+        2. Switch to **Performance & Polars** to compute polars and view **CL**, **CD**, **L/D**, and **α\***.  
+        3. In the **Dialogue** (left), pick a role in **🎭 Choose AI Module**, ask a question, or click **📥 Insert Simulation Data** to auto-paste your current settings, then discuss improvements with the AI.  
+        4. Use **History** to view or export saved runs and **Restore historical dialogue** to reload past chats (per user).
+        """)
+
+            st.markdown("### Page Layout")
+            st.markdown("""
+        - **Left column**: Dialogue (role selection, search, history restore, input & send).  
+        - **Right column**: Tabs for **Geometry & Parameters**, **Performance & Polars**, **History**, **Help**, and **Admin** (admin only).
+        """)
+
+            with st.expander("AI Roles (when to use which)"):
+                st.markdown("""
+        - **Concept Learning** — Clarify core concepts (e.g., lift coefficient, stall, Reynolds number). Use a **guiding** tone, ask probing questions.  
+        - **Model Iteration** — Plan experiments, scan parameters (α range/step, Re, Ncrit) and compare outcomes.  
+        - **Strategy Review** — Critically evaluate your approach (claim–evidence–warrant), surface gaps and next steps.
+        """)
+
+            with st.expander("Geometry & Parameters (what each control means)"):
+                st.markdown("""
+        - **NACA 4-digit** (`mpt` → `m%`, `p/10`, `t%`): `m` camber, `p` chordwise location of max camber, `t` thickness.  
+        - **Flow**: ρ (density), **V** (velocity), **c** (chord), **μ** (dynamic viscosity). Reynolds number `Re = ρVc/μ`.  
+        - **Solver**: **Mach** (typically ≤ 0.3 for incompressible assumptions), **Ncrit** (transition criterion, e.g., 5–9 for typical wind-tunnel atmospheres).  
+        - **Scan**: α range `[α_min, α_max]` and step `Δα` for **ASEQ** scanning; use a smaller `Δα` for finer L/D peaks.
+        """)
+
+            with st.expander("Performance & Polars (how to read the plots)"):
+                st.markdown("""
+        - **CL(α)**, **CD(α)**, **CM(α)** are computed from XFOIL polars.  
+        - **L/D** helps locate efficient angles; the app highlights **α\*** where L/D is maximal in the scanned range.  
+        - If XFOIL returns no valid data, the app will show a **simulated fallback** curve (for UI continuity). Prefer fixing inputs to get physical results.
+        """)
+
+            with st.expander("Dialogue & Data (good practices)"):
+                st.markdown("""
+        - Use **📥 Insert Simulation Data** to paste the current setup into the chat, then ask the AI to critique or suggest iterations.  
+        - Phrase prompts for **reasoning**, e.g., *“If I increase `t%` while keeping `Re` fixed, what trade-offs appear in stall and L/D?”*  
+        - **History** tab: inspect, refresh, and export your saved runs (CSV). **Admin** can export all users’ data.
+        """)
+
+            st.markdown("### Methodological Guidance")
+            st.markdown("""
+        - Treat the AI as a **Socratic partner**: ask “why/how” questions, test hypotheses, and compare runs under controlled changes.  
+        - For argumentation, structure your notes as **Claim–Evidence–Warrant** (and add Qualifiers/Rebuttals when applicable).  
+        - Keep **Re**, **α range**, **Δα**, **Ncrit** explicit in your lab notes to ensure **reproducibility**.
+        """)
+
+            st.markdown("### FAQ")
+            st.markdown("""
+        **Q1. My input remains in the box after sending.**  
+        The app clears after submission; if you still see text, refresh the page to resync the widget state.
+
+        **Q2. XFOIL returns no polar or `polar.out` is empty.**  
+        Check α range/step and `Re` magnitude; try moderate **Ncrit** (e.g., 7) and ensure `xfoil.exe` exists in the app root on Windows. If geometry is extreme (very high camber/thickness or tiny `Re`), start with gentler values.
+
+        **Q3. L/D looks strange or NaN.**  
+        This occurs if **CD ≈ 0** or data is sparse. Reduce `Δα`, widen the scan, or adjust `Re`/`Ncrit` for a stable polar.
+
+        **Q4. “Address already in use” on port 8000/8501.**  
+        Stop previous processes using those ports (Windows: Task Manager or `netstat` + `taskkill`; Linux/macOS: `lsof -i :PORT` then `kill -9 PID`).
+        """)
+
+            st.markdown("### Troubleshooting Checklist")
+            st.markdown("""
+        - ✅ **Executable**: On Windows, ensure **`xfoil.exe`** is in the project root.  
+        - ✅ **Ranges**: Use reasonable **α** ranges (e.g., 0°–10°) and `Δα` (0.5°–1°) to start.  
+        - ✅ **Reynolds**: Verify `Re = ρVc/μ` is not pathologically small/large for your case.  
+        - ✅ **Ncrit**: Start near 7; move ±2 if convergence is poor.  
+        - ✅ **Fallback**: If you see a fallback curve, it means no valid XFOIL data—adjust inputs and recompute.
+        """)
+
+            st.markdown("### Notes on Ethics & Data")
+            st.markdown("""
+        - Use the system for **learning and research**; cite results appropriately in coursework or publications.  
+        - Dialogue logs and run data may be stored for analysis; anonymize when required by your IRB/ethics policy.
+        """)
+
+            st.info("This Help is adapted from your uploaded quick-guide and refined for clarity and research use. "
+                    "For classroom deployment, you may extend with course-specific rubrics and examples. "
+                    "Source: internal guide. "
+                    ":contentReference[oaicite:0]{index=0}")
 
     # === Admin Panel ===
     with tab_admin:
@@ -1279,4 +1632,3 @@ with col_main:
                     st.error(f"⚠️ Error fetching airfoils: {e}")
         else:
             st.warning("Enter the correct admin password to access this panel.")
-
