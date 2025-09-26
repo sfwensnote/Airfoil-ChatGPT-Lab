@@ -747,9 +747,14 @@ with col_chat:
         else:
             st.caption("🔎 No hits")
 
-    # --- holder: the same iframe will be redrawn during streaming ---
+     # --- holder: the same iframe will be redrawn during streaming ---
     chat_iframe_holder = st.empty()
     CHAT_HEIGHT = 500
+    # ⚠️ Streamlit 会在任意控件变动后整体 rerun，新的 placeholder
+    # 是空的。如果我们仅依赖 last_chat_doc_sig，则因为签名未变
+    # 会跳过首次渲染，导致聊天框看起来被“刷掉”。因此每次 rerun
+    # 后重置一个标记，确保首帧一定会写入 iframe。
+    st.session_state["_chat_iframe_ready"] = False
 
 
     def render_chat_box(messages, q, *, force=False, target_id="", stream=False):
@@ -960,8 +965,12 @@ requestAnimationFrame(() => setTimeout(() => {{
         if "last_chat_doc_sig" not in st.session_state:
             st.session_state["last_chat_doc_sig"] = None
 
-        # 只有内容变化或 force=True 时才重绘 iframe（否则保持现有 iframe，不触发卸载/重建）
-        if force or st.session_state["last_chat_doc_sig"] != doc_sig:
+        first_frame = not st.session_state.get("_chat_iframe_ready", False)
+        if first_frame:
+            st.session_state["_chat_iframe_ready"] = True
+
+        # 只有内容变化/首帧/force=True 时才重绘 iframe
+        if force or first_frame or st.session_state["last_chat_doc_sig"] != doc_sig:
             st.session_state["last_chat_doc_sig"] = doc_sig
             with chat_iframe_holder:
                 components.html(
@@ -1723,3 +1732,4 @@ with col_main:
                     st.error(f" Error fetching airfoils: {e}")
         else:
             st.warning("Enter the correct admin password to access this panel.")
+
