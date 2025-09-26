@@ -49,13 +49,13 @@ def _which_xfoil():
     exe_path = os.path.join(os.getcwd(), "xfoil.exe")
     if os.path.exists(exe_path):
         return exe_path
-    raise FileNotFoundError("❌ 没有找到 xfoil.exe，请确认它在 bot-remote-windows 目录下")
+    raise FileNotFoundError(" 没有找到 xfoil.exe，请确认它在 bot-remote-windows 目录下")
 
 def run_xfoil_cli_polar(naca_code: str, Re: float, Mach: float, Ncrit: float,
                         alpha_start: float, alpha_end: float, alpha_step: float) -> pd.DataFrame:
     exe = os.path.abspath("xfoil.exe")  # ✅ 强制使用当前目录下的 xfoil.exe
     if not os.path.exists(exe):
-        print("❌ xfoil.exe not found in", exe)
+        print(" xfoil.exe not found in", exe)
         return pd.DataFrame(columns=["alpha", "CL", "CD", "CM"])
 
     with tempfile.TemporaryDirectory() as td:
@@ -95,7 +95,7 @@ QUIT
         print("=== XFOIL STDERR ===\n", (result.stderr or "")[:400])
 
         if not os.path.exists(pol_path):
-            print("❌ polar.out not generated")
+            print(" polar.out not generated")
             return pd.DataFrame(columns=["alpha", "CL", "CD", "CM"])
 
         # ✅ 解析 polar.out
@@ -116,7 +116,7 @@ QUIT
                         continue
 
         if not rows:
-            print("⚠️ polar.out parsed but empty")
+            print(" polar.out parsed but empty")
             return pd.DataFrame(columns=["alpha", "CL", "CD", "CM"])
 
         return pd.DataFrame(rows, columns=["alpha", "CL", "CD", "CM"]).sort_values("alpha").reset_index(drop=True)
@@ -307,6 +307,44 @@ def call_llm_with_retries(state: dict, retries: int = 3, base_delay: float = 2.0
         pass
     return ""
 
+# ==== Stream Chat (OpenAI-compatible, via SSE) ====
+OPENAI_BASE_URL = "http://49.51.37.239:3006/v1"  # 与你上面 llm 的 base_url 一致
+OPENAI_API_KEY  = "sk-VrwOEEFLgjJwSOjH5pHRTDorgf0SmJVQrjK2D1uyjxZcfsrn"  # 与你上面 llm 的 api_key 一致
+
+def stream_chat_completions(messages, model="gpt-4o", temperature=0.2, timeout=60):
+    """
+    直接调用 OpenAI 兼容接口进行流式输出（SSE）。yield 每个新增的 content 片段（可能为空串）。
+    messages: [{"role":"system","content":...}, {"role":"user","content":...}, ...]
+    """
+    import requests, json
+    url = f"{OPENAI_BASE_URL}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "temperature": float(temperature),
+        "stream": True,
+        "messages": messages
+    }
+    with requests.post(url, headers=headers, json=payload, stream=True, timeout=timeout) as r:
+        r.raise_for_status()
+        for line in r.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            if line.startswith("data:"):
+                data = line[len("data:"):].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                    delta = obj["choices"][0]["delta"]
+                    yield delta.get("content", "")
+                except Exception:
+                    # 忽略无法解析的片段
+                    continue
+
 
 
 # =========================
@@ -349,7 +387,6 @@ def estimate_Re(rho: float, V: float, chord: float, mu: float) -> float:
 # —— Streamlit UI ——
 # =====================
 st.set_page_config(page_title="Fluid Mechanics AI Assistant", layout="wide")
-
 # --- 合并且加固的样式（只保留这一个 <style>） ---
 st.markdown("""
 <style>
@@ -541,7 +578,7 @@ with col_chat:
             else:
                 st.info("ℹ️ No historical records were found")
         except Exception as e:
-            st.error(f"⚠️ Error fetching history: {e}")
+            st.error(f" Error fetching history: {e}")
 
     # === 每个用户独立的聊天 key ===
     chat_key = f"chat_history_{user_id}"
@@ -671,7 +708,7 @@ with col_chat:
 
     # 1) 收集符合模块的 AI 回复与其前面的 user
     for i, msg in enumerate(messages):
-        if msg["role"] == "ai":
+        if msg["role"] in ("ai", "ai_stream"):
             module = msg.get("module", "AI")
             if module in allowed:
                 include_pair(i)
@@ -710,26 +747,249 @@ with col_chat:
         else:
             st.caption("🔎 No hits")
 
+    # --- holder: the same iframe will be redrawn during streaming ---
+    chat_iframe_holder = st.empty()
+    CHAT_HEIGHT = 500
+
+
+    def render_chat_box(messages, q, *, force=False, target_id="", stream=False):
+        """
+        重绘聊天 iframe。
+        - 仅显示被筛选模块的 AI/ai_stream + 它前一条 user；若最后一条是 user 也显示
+        - 流式阶段 (stream=True) 关闭高亮和安全清洗以提速，最终帧再开启
+        - force=True 仅用于首帧或末帧；中间帧 force=False，配合上游节流调用
+        """
+        allowed = set(st.session_state["chat_filter_roles"])
+        n = len(messages)
+        display_indices = []
+
+        def include_pair(ai_idx: int):
+            if 0 <= ai_idx < n and ai_idx not in display_indices:
+                display_indices.append(ai_idx)
+            j = ai_idx - 1
+            while j >= 0 and messages[j]["role"] == "system":
+                j -= 1
+            if j >= 0 and messages[j]["role"] == "user" and j not in display_indices:
+                display_indices.append(j)
+
+        # 选取需要展示的条目
+        for i, msg in enumerate(messages):
+            if msg["role"] in ("ai", "ai_stream"):
+                module = msg.get("module", "AI")
+                if module in allowed:
+                    include_pair(i)
+        if n > 0 and messages[-1]["role"] == "user":
+            if (n - 1) not in display_indices:
+                display_indices.append(n - 1)
+        display_indices.sort()
+
+        # 搜索命中（流式阶段跳过高亮/命中计算）
+        hits = []
+        q_norm = (q or "").strip()
+        if q_norm and not stream:
+            q_lower = q_norm.lower()
+            for i in display_indices:
+                if q_lower in str(messages[i].get("content", "")).lower():
+                    hits.append(i)
+
+        # 渲染 HTML（流式阶段 safe=False 且不高亮）
+        inner_html = ""
+        for i in display_indices:
+            msg = messages[i]
+            raw = str(msg.get("content", ""))
+            rendered = render_markdown_to_html(raw, safe=not stream)
+            content_html = rendered if stream else highlight_after_rendered(rendered, q_norm)
+
+            if msg["role"] == "user":
+                inner_html += (
+                    f"<div class='bubble user-bubble' id='msg-{i}'>"
+                    f"👤 You ({html.escape(user_id)})<br>{content_html}</div>"
+                )
+            elif msg["role"] in ("ai", "ai_stream"):
+                module = msg.get("module", "AI")
+                css_class = {
+                    "Concept Learning": "concept",
+                    "Model Iteration": "model",
+                    "Strategy Review": "strategy"
+                }.get(module, "")
+                inner_html += (
+                    f"<div class='bubble ai-bubble {css_class}' id='msg-{i}'>"
+                    f"🤖 {html.escape(module)}<br>{content_html}</div>"
+                )
+            elif msg["role"] == "system":
+                inner_html += f"<div class='system' id='msg-{i}'>{content_html}</div>"
+
+        FORCE = str(bool(force)).lower()
+        TARGET = json.dumps(target_id)
+
+        html_doc = f"""<!DOCTYPE html>
+    <html>
+    <head>
+    <meta charset="utf-8" />
+    <style>
+      html, body {{
+        margin:0; padding:0; height:100%; overflow:hidden;
+        font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial;
+      }}
+      .chat-wrapper {{
+        background-color:#f5f5f5; padding:12px; border-radius:10px;
+        height:{CHAT_HEIGHT}px; overflow-y:auto; display:flex; flex-direction:column;
+        /* 不在容器上使用 smooth，避免频繁动画抖动 */
+        overscroll-behavior:contain; scrollbar-gutter:stable;
+      }}
+      .bubble {{
+        max-width:75%; padding:8px 12px; margin:6px; border-radius:8px; word-wrap:break-word;
+        font-size:14px; line-height:1.4;
+      }}
+      .user-bubble {{ background-color:#95ec69; margin-left:auto; text-align:right; }}
+      .ai-bubble   {{ margin-right:auto; text-align:left; }}
+      .concept {{ background-color:#d0e6ff; }}
+      .model   {{ background-color:#ffe4b3; }}
+      .strategy{{ background-color:#e6ccff; }}
+      .system {{ color:#555; text-align:center; font-size:13px; font-style:italic; margin:4px 0; }}
+      .hit-focus {{ outline:2px solid #ffb703; transition:outline 1.2s ease-in-out; }}
+      mark {{ padding:0 2px; }}
+      pre, code {{ font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12.5px; }}
+      pre {{ background:#f7f7f9; padding:8px 10px; border-radius:6px; overflow:auto; }}
+      table {{ border-collapse:collapse; max-width:100%; }}
+      th, td {{ border:1px solid #e5e7eb; padding:4px 8px; font-size:13px; }}
+      blockquote {{ border-left:3px solid #e5e7eb; margin:6px 0; padding:4px 8px; color:#444; }}
+    </style>
+    </head>
+    <body>
+      <div class="chat-wrapper" id="chat-box">{inner_html}</div>
+
+    <script>
+    (function () {{
+      const chatBox = document.getElementById('chat-box');
+      if (!chatBox) return;
+
+      const FORCE  = {FORCE};
+      const TARGET = {TARGET};
+
+      const STORAGE_KEY = "autoFollow:" + {json.dumps(user_id)};
+      const SCROLL_KEY  = "scrollTop:"  + {json.dumps(user_id)};
+
+      function getAutoFollow() {{
+        const v = localStorage.getItem(STORAGE_KEY);
+        return (v === null) ? true : v === "1";
+      }}
+      function setAutoFollow(on) {{ localStorage.setItem(STORAGE_KEY, on ? "1" : "0"); }}
+
+      function saveScroll() {{
+        try {{ sessionStorage.setItem(SCROLL_KEY, String(chatBox.scrollTop)); }} catch (e) {{}}
+      }}
+      function restoreScroll() {{
+        try {{
+          const v = sessionStorage.getItem(SCROLL_KEY);
+          if (v !== null) {{
+            const n = parseInt(v, 10);
+            if (!Number.isNaN(n)) chatBox.scrollTop = n;
+          }}
+        }} catch (e) {{}}
+      }}
+
+      function isAtBottom() {{
+        return chatBox.scrollTop + chatBox.clientHeight >= chatBox.scrollHeight - 40;
+      }}
+      function scrollToBottom(force) {{
+        if (force || (getAutoFollow() && isAtBottom())) {{
+          chatBox.scrollTop = chatBox.scrollHeight; // 瞬时置底
+        }}
+      }}
+      function scrollToTarget(id) {{
+        if (!id) return false;
+        const el = document.getElementById(id);
+        if (el) {{
+          el.scrollIntoView({{ behavior: 'auto', block: 'end' }});
+          setAutoFollow(false);
+          el.classList.add("hit-focus");
+          setTimeout(() => el.classList.remove("hit-focus"), 1200);
+          return true;
+        }}
+        return false;
+      }}
+
+      // 初始化：仅在 FORCE=True 或有 TARGET 时干预滚动；否则完全不动当前滚动位置
+requestAnimationFrame(() => setTimeout(() => {{
+  if (FORCE) {{
+    setAutoFollow(true);
+    scrollToBottom(true);   // 只在明确要求时置底
+  }} else if (TARGET) {{
+    scrollToTarget(TARGET); // 有定位目标时滚到目标
+  }} // 否则：不 restore、不置底，避免反复跳动
+}}, 0));
+
+
+      // DOM 变更：仅在 autoFollow 时置底，并用 rAF 合并多次变更
+      let rafId = null;
+      const mo = new MutationObserver(() => {{
+        if (!getAutoFollow()) return;
+        if (rafId) cancelAnimationFrame(rafId);
+        rafId = requestAnimationFrame(() => {{
+          chatBox.scrollTop = chatBox.scrollHeight;
+          rafId = null;
+        }});
+      }});
+      mo.observe(chatBox, {{ childList: true, subtree: true }});
+
+      // 用户滚动：上滚关闭自动跟随；到底开启
+      let lastTop = chatBox.scrollTop;
+      chatBox.addEventListener('scroll', () => {{
+        saveScroll();
+        const nowTop = chatBox.scrollTop;
+        const delta  = nowTop - lastTop;
+        lastTop = nowTop;
+        if (delta < -10) {{
+          setAutoFollow(false);
+        }} else if (isAtBottom()) {{
+          setAutoFollow(true);
+        }}
+      }});
+
+      window.addEventListener('beforeunload', saveScroll);
+    }})();
+    </script>
+    </body>
+    </html>
+    """
+        # —— 计算轻量签名：内容 + 强制标志 + 定位目标 + 是否处于流式模式
+        doc_sig = hash((inner_html, FORCE, TARGET, bool(stream)))
+
+        # 首次初始化
+        if "last_chat_doc_sig" not in st.session_state:
+            st.session_state["last_chat_doc_sig"] = None
+
+        # 只有内容变化或 force=True 时才重绘 iframe（否则保持现有 iframe，不触发卸载/重建）
+        if force or st.session_state["last_chat_doc_sig"] != doc_sig:
+            st.session_state["last_chat_doc_sig"] = doc_sig
+            with chat_iframe_holder:
+                components.html(
+                    html_doc,
+                    height=CHAT_HEIGHT + 6,
+                    scrolling=False,
+                )
+
 
     # ===== Markdown rendering (server-side) =====
-    def render_markdown_to_html(md_text: str) -> str:
-        """Render Markdown to safe HTML. Falls back to a minimal converter if libs are missing."""
+    def render_markdown_to_html(md_text: str, safe=True):
+        """safe=True 用 bleach；流式时传 safe=False 以提速"""
         try:
             import markdown as md
-            html_out = md.markdown(md_text, extensions=["fenced_code", "tables", "toc", "sane_lists"])
-            try:
-                import bleach
-                allowed = bleach.sanitizer.ALLOWED_TAGS.union(
-                    {"p", "pre", "code", "table", "thead", "tbody", "tr", "th", "td", "hr",
-                     "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li", "blockquote"}
-                )
-                return bleach.clean(html_out, tags=allowed, strip=True)
-            except Exception:
-                return html_out
+            html_out = md.markdown(md_text, extensions=["fenced_code", "tables", "sane_lists"])
+            if safe:
+                try:
+                    import bleach
+                    allowed = bleach.sanitizer.ALLOWED_TAGS.union(
+                        {"p", "pre", "code", "table", "thead", "tbody", "tr", "th", "td", "hr",
+                         "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li", "blockquote"}
+                    )
+                    return bleach.clean(html_out, tags=allowed, strip=True)
+                except Exception:
+                    return html_out
+            return html_out
         except Exception:
-            # minimal fallback: keep bold / code / line breaks
-            s = html.escape(md_text, quote=False)
-            s = s.replace("**", "<b>").replace("`", "<code>")
+            s = html.escape(md_text, quote=False).replace("**", "<b>").replace("`", "<code>")
             return s.replace("\n", "<br>")
 
 
@@ -741,201 +1001,11 @@ with col_chat:
                       html_text, flags=re.IGNORECASE)
 
 
-    # === 渲染聊天（组件版：iframe 内完全可控） ===
-    inner_html = ""
-    for i, msg in enumerate(messages):
-        if i not in display_indices:
-            continue
-        raw = str(msg.get("content", ""))
-        rendered = render_markdown_to_html(raw)  # Markdown → safe HTML
-        content_html = highlight_after_rendered(rendered, q)  # 可选高亮
-        if msg["role"] == "user":
-            inner_html += f"<div class='bubble user-bubble' id='msg-{i}'>👤 You ({user_id})<br>{content_html}</div>"
-        elif msg["role"] == "ai":
-            module = msg.get("module", "AI")
-            css_class = {
-                "Concept Learning": "concept",
-                "Model Iteration": "model",
-                "Strategy Review": "strategy"
-            }.get(module, "")
-            inner_html += f"<div class='bubble ai-bubble {css_class}' id='msg-{i}'>🤖 {module}<br>{content_html}</div>"
-        elif msg["role"] == "system":
-            inner_html += f"<div class='system' id='msg-{i}'>{content_html}</div>"
-
     _force = bool(st.session_state.get("force_scroll_bottom", False))
     target_id = st.session_state.get("scroll_to_msg_id", "")
-
-    # 用完即清（避免下次重复触发）
     st.session_state["force_scroll_bottom"] = False
     st.session_state["scroll_to_msg_id"] = ""
-
-    CHAT_HEIGHT = 500
-
-    components.html(f"""
-    <!DOCTYPE html>
-    <html><head><meta charset="utf-8" />
-    <style>
-      html, body {{
-        margin: 0; padding: 0; height: 100%; overflow: hidden;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial;
-      }}
-      .chat-wrapper {{
-          background-color: #f5f5f5;
-          padding: 12px;
-          border-radius: 10px;
-          height: {CHAT_HEIGHT}px;
-          overflow-y: auto;
-          display: flex;
-          flex-direction: column;
-          scroll-behavior: smooth;
-          overscroll-behavior: contain;
-          scrollbar-gutter: stable;
-      }}
-      .bubble {{
-          max-width: 75%;
-          padding: 8px 12px;
-          margin: 6px;
-          border-radius: 8px;
-          word-wrap: break-word;
-          font-size: 14px;
-          line-height: 1.4;
-      }}
-      .user-bubble {{ background-color: #95ec69; margin-left: auto; text-align: right; }}
-      .ai-bubble {{ margin-right: auto; text-align: left; }}
-      .concept {{ background-color: #d0e6ff; }}
-      .model {{ background-color: #ffe4b3; }}
-      .strategy {{ background-color: #e6ccff; }}
-      .system {{
-          color: #555;
-          text-align: center;
-          font-size: 13px;
-          font-style: italic;
-          margin: 4px 0;
-      }}
-      .hit-focus {{
-          outline: 2px solid #ffb703;
-          transition: outline 1.2s ease-in-out;
-      }}
-      mark {{ padding: 0 2px; }}
-      /* code/table styling for rendered Markdown */
-  pre, code {{
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    font-size: 12.5px;
-  }}
-  pre {{
-    background: #f7f7f9;
-    padding: 8px 10px;
-    border-radius: 6px;
-    overflow: auto;
-  }}
-  table {{ border-collapse: collapse; max-width: 100%; }}
-  th, td {{ border: 1px solid #e5e7eb; padding: 4px 8px; font-size: 13px; }}
-  blockquote {{ border-left: 3px solid #e5e7eb; margin: 6px 0; padding: 4px 8px; color:#444; }}
- 
-    </style>
-    </head>
-    <body>
-      <div class="chat-wrapper" id="chat-box">{inner_html}</div>
-
-  <script>
-(function() {{
-  const chatBox = document.getElementById('chat-box');
-  if (!chatBox) return;
-
-  // Python → JS 注入（保持不变）
-  const FORCE  = {str(_force).lower()};
-  const TARGET = {json.dumps(target_id)};
-
-  // 使用 user_id 构造本地存储键；避免使用模板字符串以防 f-string 解析
-  const STORAGE_KEY = "autoFollow:" + {json.dumps(user_id)};
-  const SCROLL_KEY  = "scrollTop:"  + {json.dumps(user_id)};
-
-  // --- auto-follow state (persisted via localStorage) ---
-  function getAutoFollow() {{
-    const v = localStorage.getItem(STORAGE_KEY);
-    return (v === null) ? true : v === "1";
-  }}
-  function setAutoFollow(on) {{
-    localStorage.setItem(STORAGE_KEY, on ? "1" : "0");
-  }}
-
-  // --- scrollTop persistence (sessionStorage) ---
-  function saveScroll() {{
-    try {{
-      sessionStorage.setItem(SCROLL_KEY, String(chatBox.scrollTop));
-    }} catch (e) {{}}
-  }}
-  function restoreScroll() {{
-    try {{
-      const v = sessionStorage.getItem(SCROLL_KEY);
-      if (v !== null) {{
-        const n = parseInt(v, 10);
-        if (!Number.isNaN(n)) chatBox.scrollTop = n;
-      }}
-    }} catch (e) {{}}
-  }}
-
-  function isAtBottom() {{
-    return chatBox.scrollTop + chatBox.clientHeight >= chatBox.scrollHeight - 40;
-  }}
-  function scrollToBottom(force) {{
-    if (force || (getAutoFollow() && isAtBottom())) {{
-      chatBox.scrollTop = chatBox.scrollHeight;
-    }}
-  }}
-  function scrollToTarget(id) {{
-    if (!id) return false;
-    const el = document.getElementById(id);
-    if (el) {{
-      el.scrollIntoView({{ behavior: 'smooth', block: 'end' }});
-      setAutoFollow(false);
-      el.classList.add("hit-focus");
-      setTimeout(() => el.classList.remove("hit-focus"), 1200);
-      return true;
-    }}
-    return false;
-  }}
-
-  // Initial mount: prefer TARGET; else restore; apply FORCE if requested
-  requestAnimationFrame(() => setTimeout(() => {{
-    if (!scrollToTarget(TARGET)) {{
-      if (!FORCE) restoreScroll();
-      if (FORCE) setAutoFollow(true);
-      scrollToBottom(FORCE);
-    }}
-  }}, 0));
-
-  // Auto-follow when new nodes added (unless user scrolled up)
-  const mo = new MutationObserver(() => {{
-    if (getAutoFollow()) {{
-      chatBox.scrollTop = chatBox.scrollHeight;
-    }} else if (isAtBottom()) {{
-      setAutoFollow(true);
-    }}
-  }});
-  mo.observe(chatBox, {{ childList: true, subtree: true }});
-
-  // User scroll behavior: scroll up → disable follow; bottom → enable follow
-  let lastTop = chatBox.scrollTop;
-  chatBox.addEventListener('scroll', () => {{
-    saveScroll();
-    const nowTop = chatBox.scrollTop;
-    const delta  = nowTop - lastTop;
-    lastTop = nowTop;
-    if (delta < -10) {{
-      setAutoFollow(false);
-    }} else if (isAtBottom()) {{
-      setAutoFollow(true);
-    }}
-  }});
-
-  // Persist before unload (tab close / refresh)
-  window.addEventListener('beforeunload', saveScroll);
-}})();
-</script>
-
-    </body></html>
-    """, height=CHAT_HEIGHT + 6, scrolling=False)
+    render_chat_box(st.session_state[chat_key], q, force=_force, target_id=target_id)
 
     # === 角色选择 ===
     role_help = {
@@ -945,22 +1015,21 @@ with col_chat:
     }
     # --- Concise Mode toggle (EN) ---
     concise = st.toggle(
-        "✂️ Concise mode (≤6 lines + ≤2 questions)",
+        "✂️ Concise mode (Get a more concise answer)",
         value=True,
         help="Limit length and number of probing questions"
     )
 
 
     def get_prompt(role):
-        style_guard = (
-            "When replying, ALWAYS follow this structure:\n"
-            "1) Key points (≤4 bullet points)\n"
-            "2) Evidence/Reasoning (≤2 sentences)\n"
-            "3) Next step (≤1 actionable step)\n"
-            "Ask at most 2 short questions.\n"
-        )
-        length_guard = "Hard cap: ≤6 lines total. Avoid meta talk." if concise else "No hard cap. Provide details when useful."
-        sys = f"{roles[role]}\n{style_guard}{length_guard}\nHistorical Dialogue: {{history}}"
+        # ✅ Softer guidance for concise mode
+        guidance_on = "Reply more concisely and ask fewer but precise questions."
+        guidance_off = "Provide complete, well-reasoned explanations when useful."
+
+        sys = f"""{roles[role]}
+    Writing style guidance: {{guidance}}
+    Historical Dialogue: {{history}}"""
+
         return ChatPromptTemplate.from_messages([
             ("system", sys),
             ("user", "{question}")
@@ -986,7 +1055,10 @@ with col_chat:
         st.session_state["prev_role"] = selected_role
     if st.session_state["prev_role"] != selected_role:
         st.session_state["prev_role"] = selected_role
-        st.session_state["force_scroll_bottom"] = True  # ✅ 切换角色后滚到最新
+        # 切换角色时，仅跳到最后一条消息；不强制自动置底，避免可见跳动
+        last_idx = len(st.session_state[chat_key]) - 1
+        st.session_state["scroll_to_msg_id"] = f"msg-{last_idx}" if last_idx >= 0 else ""
+        st.session_state["force_scroll_bottom"] = False
 
     # === 输入框 + 发送 & 清除按钮（同一行）===
     st.markdown(
@@ -1050,11 +1122,9 @@ with col_chat:
     st.markdown('</div>', unsafe_allow_html=True)
 
 
-    # === 插入仿真数据按钮（风格统一）===
-    insert_sim = st.button("📥 Insert Simulation Data", use_container_width=True)
-
-    # === 插入仿真数据逻辑 ===
-    if insert_sim:
+    # === 插入仿真数据按钮（回调，不强制 rerun）===
+    def _on_insert_sim():
+        # 直接从 session_state 读取当前右侧参数
         m = st.session_state.get("camber_pct", 2.0) / 100
         p = st.session_state.get("p_pct", 40.0) / 100
         t = st.session_state.get("thickness_pct", 12.0) / 100
@@ -1082,10 +1152,14 @@ with col_chat:
             f"➡️ How can I improve my design strategy based on this?"
         )
 
-        # 覆盖 value 源并切换到新 key → 下轮渲染文本框显示仿真内容
+        # 只更新状态即可；按钮被点击本身就会触发一次 rerun
         st.session_state["question_buf"] = sim_text
         st.session_state["input_epoch"] += 1
-        st.rerun()
+        st.session_state["force_scroll_bottom"] = True  # 聊天框置底
+
+
+    # 用 on_click 绑定回调；不要再写 if insert_sim: 分支，也不要 st.rerun()
+    st.button("📥 Insert Simulation Data", use_container_width=True, on_click=_on_insert_sim)
 
     # === 发送消息逻辑 ===
     if submit and question.strip():
@@ -1108,31 +1182,83 @@ with col_chat:
                 timeout=10
             )
         except Exception as e:
-            st.warning(f"⚠️ Failed to save user message: {str(e)}")
+            st.warning(f" Failed to save user message: {str(e)}")
 
         # 3) 调用 LLM（LangGraph）
-        # 3) Call LLM with retries (LangGraph)
+        # 3) 流式调用 LLM（SSE）并把气泡画在 iframe 里
         answer = ""
         try:
+            # ✅ Softer concise-mode guidance (no hard caps)
+            guidance_on  = "Reply more concisely and ask fewer but precise questions."
+            guidance_off = "Provide complete, well-reasoned explanations when useful."
+            guidance = guidance_on if concise else guidance_off
+
             history = "\n".join([f"{m['role']}: {m['content']}" for m in st.session_state[chat_key]])
-            state = {
-                "role": selected_role,
-                "history": history,
-                "question": student_question,
-            }
-            # use retry helper
-            answer = call_llm_with_retries(state, retries=3, base_delay=2.0)
+            system_msg = f"{roles[selected_role]}\nWriting style guidance: {guidance}\nHistorical Dialogue: {history}"
+            messages_oa = [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": student_question}
+            ]
+
+            # --- 在会话里追加“临时流式消息” ---
+            st.session_state[chat_key].append({
+                "role": "ai_stream",  # 临时类型：渲染时与 ai 相同
+                "content": "",
+                "module": selected_role
+            })
+            stream_idx = len(st.session_state[chat_key]) - 1
+
+            # 先重绘一次，出现空壳气泡
+            render_chat_box(st.session_state[chat_key], q, force=True, target_id=f"msg-{stream_idx}")
+
+            # —— 流式增量（首帧 force=True；中间帧节流；末帧 force=True） —— #
+            acc = ""
+            last_draw = 0.0
+            REDRAW_INTERVAL = 0.30  # 300ms，肉眼流畅又不至于频繁重建
+            try:
+                # 先画出空壳流式气泡，并强制置底一次（首帧）
+                render_chat_box(st.session_state[chat_key], q, force=True,
+                                target_id=f"msg-{stream_idx}", stream=True)
+
+                for delta in stream_chat_completions(messages_oa, model="gpt-4o", temperature=0.2, timeout=90):
+                    if not delta:
+                        continue
+                    acc += delta
+                    st.session_state[chat_key][stream_idx]["content"] = acc
+
+                    now = time.time()
+                    # 节流：约 80ms 重绘一次；中间帧不要 force
+                    if now - last_draw >= REDRAW_INTERVAL:
+                        render_chat_box(st.session_state[chat_key], q, force=False,
+                                        target_id=f"msg-{stream_idx}", stream=True)
+                        last_draw = now
+
+                # 流式结束：做一次最终重绘（恢复安全清洗与高亮），并强制置底
+                st.session_state[chat_key][stream_idx]["content"] = acc
+                answer = (acc or "").strip()
+                st.session_state[chat_key][stream_idx]["role"] = "ai"  # 转正
+                render_chat_box(st.session_state[chat_key], q, force=True,
+                                target_id=f"msg-{stream_idx}", stream=False)
+
+            except Exception:
+                # 流式失败就回退到一次性
+                state = {"role": selected_role, "history": history, "question": student_question}
+                answer = call_llm_with_retries(state, retries=3, base_delay=2.0)
+                st.session_state[chat_key][stream_idx]["content"] = answer
+                st.session_state[chat_key][stream_idx]["role"] = "ai"
+                # 一次性结果：安全清洗+高亮，强制置底
+                render_chat_box(st.session_state[chat_key], q, force=True,
+                                target_id=f"msg-{stream_idx}", stream=False)
+
+
         except Exception as e:
             st.error(f"LLM call failed: {e}")
-            # 4) also log the error to backend for troubleshooting
             try:
                 requests.post(
                     f"{BACKEND_URL}/save_conversation/",
                     json={
-                        "user_id": user_id,
-                        "role": selected_role,
-                        "student_question": student_question,
-                        "ai_response": f"[ERROR] {e}",
+                        "user_id": user_id, "role": selected_role,
+                        "student_question": student_question, "ai_response": f"[ERROR] {e}",
                         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
                     },
                     timeout=10
@@ -1140,189 +1266,55 @@ with col_chat:
             except Exception:
                 pass
 
-        # 可选的用户提示：重试后仍无有效文本
+        # 无有效文本的提示
         if not answer:
             st.info(
                 "The AI returned no valid content after several attempts. Please retry in a moment or simplify your question.")
 
-        # 5) ✅ 把 AI 回复追加到前端会话，并写回后端（你当前缺的就是这一块）
+        # 5) ✅ 后端落盘
         if answer:
-            st.session_state[chat_key].append({
-                "role": "ai",
-                "content": answer,
-                "module": selected_role
-            })
             try:
                 requests.post(
                     f"{BACKEND_URL}/save_conversation/",
                     json={
-                        "user_id": user_id,
-                        "role": selected_role,
-                        "student_question": student_question,
-                        "ai_response": answer,
+                        "user_id": user_id, "role": selected_role,
+                        "student_question": student_question, "ai_response": answer,
                         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
                     },
                     timeout=10
                 )
             except Exception as e:
-                st.warning(f"⚠️ Failed to save AI reply: {e}")
+                st.warning(f" Failed to save AI reply: {e}")
 
-        # 6) 清空输入并刷新
+        # 6) 清空输入 + 强制滚底 + 最终重绘一次（保证命中计数/过滤状态正确）
         st.session_state["question_buf"] = ""
         st.session_state["input_epoch"] += 1
-        st.session_state["force_scroll_bottom"] = True  # ✅ 一定要在 rerun 之前！
-        st.rerun()
+        st.session_state["force_scroll_bottom"] = True
+        render_chat_box(st.session_state[chat_key], q, force=True,
+                        target_id=f"msg-{len(st.session_state[chat_key]) - 1}")
 
-# ===== Right: Tabs =====
+# ===== Right: Tabs (Merged Geometry + Performance) =====
 with col_main:
-    tab_geo, tab_perf, tab_hist, tab_help, tab_admin = st.tabs([
-        "🧩 Geometry & Parameters", "📈 Performance & Polars", "🗂️ History", "❓ Help", "🔑 Admin"
+    tab_gp, tab_hist, tab_help, tab_admin = st.tabs([
+        "🧩 Geometry + Performance", "🗂️ History", "❓ Help", "🔑 Admin"
     ])
 
-    # === Geometry Tab ===
-    with tab_geo:
-        # ===== 上半：预览 =====
-        st.markdown("### Airfoil Preview", help=None)
-        # 读取参数（保留你的原值来源）
-        m, p, t, alpha, rho, V, chord, mu, M, Ncrit, a_min, a_max, a_step, max_t_pos = \
-            (st.session_state.get("camber_pct", 2.0) / 100,
-             st.session_state.get("p_pct", 40.0) / 100,
-             st.session_state.get("thickness_pct", 12.0) / 100,
-             st.session_state.get("alpha_deg", 5.0),
-             st.session_state.get("rho", 1.225),
-             st.session_state.get("V", 10.0),
-             st.session_state.get("chord", 1.0),
-             st.session_state.get("mu", 1.8e-5),
-             st.session_state.get("Mach", 0.0),
-             st.session_state.get("Ncrit", 7.0),
-             st.session_state.get("alpha_range", (0.0, 10.0))[0],
-             st.session_state.get("alpha_range", (0.0, 10.0))[1],
-             st.session_state.get("alpha_step", 1.0),
-             st.session_state.get("tpos_pct", 30.0) / 100)
-
-        xs, ys = gen_naca4(m, p, t)
-        # >>> PATCH: ultra-safe, tighter Airfoil Preview (no tight/constrained/subplots_adjust)
-        fig, ax = plt.subplots(figsize=(9.0, 4.8))  # 稍大画布
-
-        # 主曲线
-        ax.plot(xs, ys, linewidth=2)
-
-        # 安全的竖线（只在 [0,1] 内才画）
-        try:
-            if 0.0 <= float(p) <= 1.0:
-                ax.axvline(x=float(p), linestyle="--", linewidth=1.2, label="Max camber pos")
-            if 0.0 <= float(max_t_pos) <= 1.0:
-                ax.axvline(x=float(max_t_pos), linestyle=":", linewidth=1.2, label="Max thickness pos")
-            ax.legend(loc="upper right", frameon=False, fontsize=10, borderaxespad=0.3, handlelength=2.4)
-        except Exception:
-            pass  # 图例出错直接忽略，不影响主图
-
-        # 轴比例与标签
-        ax.set_aspect("equal", "box")
-        ax.set_xlabel("x/c", labelpad=2)
-        ax.set_ylabel("y/c", labelpad=2)
-        ax.set_title(f"NACA {naca_code_from_mpt(m, p, t)}", pad=4, fontsize=14)
-
-        # —— 只做“安全边界”计算，全面 NaN/空数组保护 —— #
-        mask = np.isfinite(xs) & np.isfinite(ys)
-        if np.count_nonzero(mask) >= 2:
-            xlo = float(np.nanmin(xs[mask]));
-            xhi = float(np.nanmax(xs[mask]))
-            ylo = float(np.nanmin(ys[mask]));
-            yhi = float(np.nanmax(ys[mask]))
-            xr = max(xhi - xlo, 1e-6)
-            yr = max(yhi - ylo, 1e-6)
-            # 横向几乎贴边；纵向保留 ~6%
-            ax.set_xlim(xlo - 0.01 * xr, xhi + 0.01 * xr)
-            ax.set_ylim(ylo - 0.06 * yr, yhi + 0.06 * yr)
-        else:
-            # 极端情况下给个保底边界
-            ax.set_xlim(-0.01, 1.01)
-            ax.set_ylim(-0.2, 0.2)
-
-        # 去掉多余脊线，减少视觉留白
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-
-        # 关键：用固定轴矩形位置“手动紧凑”，避免与任何自动布局冲突
-        # [left, bottom, width, height] in figure coordinates (0~1)
-        # 可以再把 bottom/left 稍微变小让图更“满”，但不要 <0.05 以免文字被裁
-        ax.set_position([0.08, 0.16, 0.90, 0.78])
-
-        # 输出（若你有 fixed-plot 容器就保留；没有也可以直接 st.pyplot）
-        with st.container():
-            st.markdown('<div class="fixed-plot">', unsafe_allow_html=True)
-            st.pyplot(fig, use_container_width=True)
-            st.markdown('</div>', unsafe_allow_html=True)
-
-        Re = estimate_Re(rho, V, chord, mu)
-        st.caption(f"Re ≈ {Re:,.0f} · α={alpha:.1f}° · Ncrit={Ncrit:g} · M={M:g}")
-
-        st.markdown("---")
-
-        # ===== 下半：紧凑参数区（3×4 的栅格，尽量压缩竖向空间） =====
-        st.markdown("### Parameters", help=None)
-        # >>> PATCH: apply pending alpha (must run BEFORE creating the 'alpha_deg' slider anywhere)
+    # === Geometry + Performance (one place) ===
+    with tab_gp:
+        # ---- α 一致管理 ----
         if "pending_alpha_deg" in st.session_state:
             try:
                 st.session_state["alpha_deg"] = float(st.session_state.pop("pending_alpha_deg"))
             except Exception:
                 st.session_state.pop("pending_alpha_deg", None)
-        # >>> END PATCH
+        if "alpha_deg" not in st.session_state:
+            st.session_state["alpha_deg"] = 5.0
 
-        # --- 行1：翼型几何（用 4 列）
-        g1, g2, g3, g4 = st.columns(4)
-        with g1:
-            st.slider("Camber (%)", 0.0, 10.0, st.session_state.get("camber_pct", 2.0), 0.1, key="camber_pct")
-        with g2:
-            st.slider("Max camber pos (%)", 0.0, 100.0, st.session_state.get("p_pct", 40.0), 1.0, key="p_pct")
-        with g3:
-            st.slider("Thickness (%)", 5.0, 20.0, st.session_state.get("thickness_pct", 12.0), 0.1, key="thickness_pct")
-        with g4:
-            st.slider("Max thickness pos (%)", 0.0, 100.0, st.session_state.get("tpos_pct", 30.0), 1.0, key="tpos_pct")
-
-        # --- 行2：流场参数（4 列）
-        f1, f2, f3, f4 = st.columns(4)
-        with f1:
-            st.number_input("ρ (kg/m³)", value=float(st.session_state.get("rho", 1.225)), key="rho")
-        with f2:
-            st.number_input("V (m/s)", value=float(st.session_state.get("V", 10.0)), key="V")
-        with f3:
-            st.number_input("Chord c (m)", value=float(st.session_state.get("chord", 1.0)),
-                            min_value=0.05, step=0.05, key="chord")
-        with f4:
-            st.number_input("μ (Pa·s)", value=float(st.session_state.get("mu", 1.8e-5)),
-                            format="%.6e", key="mu")
-
-        # --- 行3：求解设置（4 列）
-        s1, s2, s3, s4 = st.columns(4)
-        with s1:
-            st.number_input("Mach", value=float(st.session_state.get("Mach", 0.0)),
-                            min_value=0.0, max_value=0.3, step=0.01, key="Mach")
-        with s2:
-            st.number_input("Ncrit", value=float(st.session_state.get("Ncrit", 7.0)),
-                            min_value=1.0, max_value=12.0, step=0.5, key="Ncrit")
-        with s3:
-            st.slider("Scan range α (°)", 0.0, 15.0, st.session_state.get("alpha_range", (0.0, 10.0)),
-                      0.5, key="alpha_range")
-        with s4:
-            st.number_input("Δα (°)", value=float(st.session_state.get("alpha_step", 1.0)),
-                            min_value=0.1, max_value=2.0, step=0.1, key="alpha_step")
-
-        # --- 行4：当前攻角（独占或与其他按钮同行）
-        h1, h2 = st.columns([2, 2])
-        with h1:
-            st.slider("Current α (°)", 0.0, 15.0, st.session_state.get("alpha_deg", 5.0), 0.5, key="alpha_deg")
-        with h2:
-            # 这里可预留按钮位，比如“一键插入仿真参数”/“保存当前几何”等
-            pass
-
-    # === Performance Tab ===
-    with tab_perf:
-        st.subheader("Performance & Polars")
+        # —— 读取共享参数 —— #
         m = st.session_state.get("camber_pct", 2.0) / 100
         p = st.session_state.get("p_pct", 40.0) / 100
         t = st.session_state.get("thickness_pct", 12.0) / 100
+        max_t_pos = st.session_state.get("tpos_pct", 30.0) / 100
         alpha = st.session_state.get("alpha_deg", 5.0)
         rho = st.session_state.get("rho", 1.225)
         V = st.session_state.get("V", 10.0)
@@ -1334,117 +1326,227 @@ with col_main:
         a_step = st.session_state.get("alpha_step", 1.0)
         naca_code = naca_code_from_mpt(m, p, t)
         Re = estimate_Re(rho, V, chord, mu)
-        df_polar = run_xfoil_polar(naca_code, Re, M, Ncrit, float(a_min), float(a_max), float(a_step))
 
-        # >>> PATCH: handle XFOIL failure (place right after df_polar = ...)
+        # 先算 polar，顶部要用
+        df_polar = run_xfoil_polar(naca_code, Re, M, Ncrit,
+                                   float(a_min), float(a_max), float(a_step))
         if df_polar.empty:
-            st.error(
-                "XFOIL produced no valid polar. Check the α scan range/step, the Reynolds number magnitude, and Ncrit.")
-            if st.button("Apply recommended scan: α = 0–10°, Δα = 0.5°, Re ≈ 3e5, Ncrit ≈ 7",
-                         key="btn_apply_recommended_scan", use_container_width=True):
-                st.session_state["alpha_range"] = (0.0, 10.0)
-                st.session_state["alpha_step"] = 0.5
-                st.rerun()
-
-            st.info("A simulated placeholder curve is shown below (non-physical). Adjust inputs and recompute.")
+            st.error("XFOIL produced no valid polar. Adjust α range/step, Re magnitude, or Ncrit.")
             df_polar = fallback_fake_polar(float(a_min), float(a_max), float(a_step))
-        # >>> END PATCH
 
+        # 指标
         idx_current = int(np.argmin(np.abs(df_polar["alpha"].values - alpha)))
         CL = float(df_polar.loc[idx_current, "CL"])
         CD = float(df_polar.loc[idx_current, "CD"])
         LD = CL / CD if CD > 1e-12 else np.nan
-
         df_valid = df_polar[df_polar["CD"] > 1e-12].copy()
         df_valid["L/D"] = df_valid["CL"] / df_valid["CD"]
         idx_opt = int(df_valid["L/D"].idxmax())
         alpha_opt = float(df_valid.loc[idx_opt, "alpha"])
         ld_max = float(df_valid.loc[idx_opt, "L/D"])
 
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("CL", f"{CL:.3f}")
-        k2.metric("CD", f"{CD:.4f}")
-        k3.metric("L/D", f"{LD:.1f}" if np.isfinite(LD) else "—")
-        k4.metric("α* (best)", f"{alpha_opt:.1f}°")
+        # =========================
+        # 顶部（≈ 1/3）：Performance（KPI + 压缩图）
+        # =========================
+        st.subheader("Performance & Polars")
 
-        st.markdown(f"**Summary:** NACA {naca_code} · Re={Re:,.0f} · L/D_max={ld_max:.1f}")
-        # >>> PATCH: current-α explanation + snap button (place right after Summary, BEFORE plotting)
-        st.caption(
-            "Current α is used to read/mark on charts (it does not change the solved polar). To include it, adjust the scan range.")
-        if not df_polar.empty and "alpha" in df_polar:
-            if st.button("Snap current α to nearest grid point", key="btn_snap_alpha", use_container_width=True):
-                alpha_grid = df_polar["alpha"].to_numpy()
-                snapped = float(alpha_grid[np.argmin(np.abs(alpha_grid - alpha))])
-                # write to pending key; let tab_geo apply it BEFORE the slider is created
-                st.session_state["pending_alpha_deg"] = snapped
-                st.rerun()
-        # >>> END PATCH
+        # KPI —— 四项固定一行（更小字号）
+        st.markdown("""
+        <style>
+          .kpi-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;
+                    border:1px solid #ededed;padding:6px 10px;border-radius:12px;background:#fafafa}
+          .kpi .lbl{font-size:.74rem;color:#555;margin:0 0 2px 0;line-height:1.05}
+          .kpi .val{font-size:1.12rem;font-weight:700;letter-spacing:.2px;margin:0;line-height:1.05;white-space:nowrap}
+        </style>
+        """, unsafe_allow_html=True)
+        st.markdown(
+            f"""
+            <div class="kpi-grid">
+              <div class="kpi"><div class="lbl">CL</div><div class="val">{CL:.3f}</div></div>
+              <div class="kpi"><div class="lbl">CD</div><div class="val">{CD:.4f}</div></div>
+              <div class="kpi"><div class="lbl">L/D</div><div class="val">{(LD if np.isfinite(LD) else float('nan')):.1f}</div></div>
+              <div class="kpi"><div class="lbl">α* (best)</div><div class="val">{alpha_opt:.1f}°</div></div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+        st.caption(f"**Summary:** NACA {naca_code} · Re={Re:,.0f} · L/D_max={ld_max:.1f}")
 
+        # 压缩版图表（控制高度以贴合“上 1/3”）
         tab1, tab2, tab3 = st.tabs(["CL vs α", "CD vs α", "L/D vs α"])
 
 
-        def _vline(ax, a_cur):
-            ax.axvline(a_cur, linestyle="--", linewidth=1.2)
+        def _pretty_axes(ax, title, xlabel, ylabel):
+            ax.set_title(title)
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel(ylabel)
+            ax.grid(True, which="both", alpha=0.25, linestyle="--", linewidth=0.9)
+            ax.tick_params(axis="both", labelsize=11, width=1.0)
+            for sp in ax.spines.values():
+                sp.set_linewidth(1.0)
 
 
-        with tab1:
-            fig_cl, ax_cl = plt.subplots(figsize=(8.0, 4.2))
-            ax_cl.plot(df_polar["alpha"], df_polar["CL"], linewidth=2)
-            _vline(ax_cl, alpha)
-            ax_cl.set_xlabel("α (deg)");
-            ax_cl.set_ylabel("CL");
-            ax_cl.set_title("CL vs α")
-            st.pyplot(fig_cl, use_container_width=True)
+        def _vline(ax, a_cur, lw=2.0):
+            ax.axvline(a_cur, linestyle="--", linewidth=lw, color="#666")
 
-        with tab2:
-            fig_cd, ax_cd = plt.subplots(figsize=(8.0, 4.2))
-            ax_cd.plot(df_polar["alpha"], df_polar["CD"], linewidth=2)
-            _vline(ax_cd, alpha)
-            ax_cd.set_xlabel("α (deg)");
-            ax_cd.set_ylabel("CD");
-            ax_cd.set_title("CD vs α")
-            st.pyplot(fig_cd, use_container_width=True)
 
-        with tab3:
-            fig2, ax2 = plt.subplots(figsize=(8.0, 4.2))
-            ax2.plot(df_valid["alpha"], df_valid["L/D"], linewidth=2)
-            _vline(ax2, alpha);
-            _vline(ax2, alpha_opt)
-            ax2.set_xlabel("α (deg)");
-            ax2.set_ylabel("L/D");
-            ax2.set_title("L/D vs α (with α* marker)")
-            st.pyplot(fig2, use_container_width=True)
+        import matplotlib as mpl
 
-        # === Save Button ===
+        rc_small = {
+            "figure.dpi": 170,
+            "axes.titlesize": 13,  # 小标题
+            "axes.labelsize": 12,
+            "xtick.labelsize": 11,
+            "ytick.labelsize": 11,
+            "lines.linewidth": 2.6
+        }
+        with mpl.rc_context(rc_small):
+            with tab1:
+                fig1, ax1 = plt.subplots(figsize=(11.2, 3.8))  # 较低高度
+                ax1.plot(df_polar["alpha"], df_polar["CL"])
+                _vline(ax1, alpha)
+                _pretty_axes(ax1, "CL vs α", "α (deg)", "CL")
+                fig1.tight_layout();
+                st.pyplot(fig1, use_container_width=True)
+
+            with tab2:
+                fig2, ax2 = plt.subplots(figsize=(11.2, 3.8))
+                ax2.plot(df_polar["alpha"], df_polar["CD"])
+                _vline(ax2, alpha)
+                _pretty_axes(ax2, "CD vs α", "α (deg)", "CD")
+                fig2.tight_layout();
+                st.pyplot(fig2, use_container_width=True)
+
+            with tab3:
+                fig3, ax3 = plt.subplots(figsize=(11.2, 3.8))
+                ax3.plot(df_valid["alpha"], df_valid["L/D"])
+                _vline(ax3, alpha);
+                _vline(ax3, alpha_opt)
+                _pretty_axes(ax3, "L/D vs α (with α* marker)", "α (deg)", "L/D")
+                fig3.tight_layout();
+                st.pyplot(fig3, use_container_width=True)
+
+        # 保存按钮（保持功能）
         if st.button("💾 Save this result", use_container_width=True):
             try:
                 payload = {
-                    "user_id": user_id,
-                    "naca_code": naca_code,
-                    "camber": m,
-                    "thickness": t,
-                    "max_camber_pos": p,
-                    "alpha": alpha,
-                    "rho": rho,
-                    "velocity": V,
-                    "chord": chord,
-                    "mu": mu,
-                    "re": Re,
-                    "ncrit": Ncrit,
-                    "mach": M,
-                    "cl": CL,
-                    "cd": CD,
-                    "ld": LD if np.isfinite(LD) else 0.0,
-                    "alpha_opt": alpha_opt,
-                    "ld_max": ld_max,
+                    "user_id": user_id, "naca_code": naca_code, "camber": m, "thickness": t,
+                    "max_camber_pos": p, "alpha": alpha, "rho": rho, "velocity": V, "chord": chord,
+                    "mu": mu, "re": Re, "ncrit": Ncrit, "mach": M, "cl": CL, "cd": CD,
+                    "ld": LD if np.isfinite(LD) else 0.0, "alpha_opt": alpha_opt, "ld_max": ld_max,
                 }
                 r = requests.post(f"{BACKEND_URL}/save_airfoil/", json=payload, timeout=10)
-                if r.status_code == 200:
-                    st.success("✅ Airfoil data saved to backend")
-                else:
-                    st.error(f"❌ Save failed: {r.text}")
+                st.success("✅ Airfoil data saved to backend" if r.status_code == 200 else f" Save failed: {r.text}")
             except Exception as e:
-                st.error(f"⚠️ Error when saving: {e}")
+                st.error(f" Error when saving: {e}")
+
+        st.divider()
+
+        # =========================
+        # =========================
+        # 下部（≈ 2/3）：先 Airfoil 预览（整行），再参数网格（4个一行）
+        # =========================
+        st.markdown("### Airfoil Preview")
+        xs, ys = gen_naca4(m, p, t)
+
+        fig, ax = plt.subplots(figsize=(12.8, 6.4))  # 预览放大
+        ax.plot(xs, ys, linewidth=2.4)
+        try:
+            if 0.0 <= float(p) <= 1.0:
+                ax.axvline(x=float(p), linestyle="--", linewidth=1.3, label="Max camber pos")
+            if 0.0 <= float(max_t_pos) <= 1.0:
+                ax.axvline(x=float(max_t_pos), linestyle=":", linewidth=1.3, label="Max thickness pos")
+            ax.legend(loc="upper right", frameon=False, fontsize=9, borderaxespad=0.2, handlelength=2.0)
+        except Exception:
+            pass
+        ax.set_aspect("equal", "box")
+        ax.set_xlabel("x/c", labelpad=2, fontsize=12)
+        ax.set_ylabel("y/c", labelpad=2, fontsize=12)
+        ax.set_title(f"NACA {naca_code}", pad=2, fontsize=12)  # 标题更小
+        mask = np.isfinite(xs) & np.isfinite(ys)
+        if np.count_nonzero(mask) >= 2:
+            xlo = float(np.nanmin(xs[mask]));
+            xhi = float(np.nanmax(xs[mask]))
+            ylo = float(np.nanmin(ys[mask]));
+            yhi = float(np.nanmax(ys[mask]))
+            xr = max(xhi - xlo, 1e-6);
+            yr = max(yhi - ylo, 1e-6)
+            ax.set_xlim(xlo - 0.01 * xr, xhi + 0.01 * xr)
+            ax.set_ylim(ylo - 0.06 * yr, yhi + 0.06 * yr)
+        else:
+            ax.set_xlim(-0.01, 1.01);
+            ax.set_ylim(-0.2, 0.2)
+        ax.spines["top"].set_visible(False);
+        ax.spines["right"].set_visible(False)
+        ax.set_position([0.06, 0.12, 0.92, 0.82])  # 画得更满
+        st.pyplot(fig, use_container_width=True)
+        st.caption(f"Re ≈ {Re:,.0f} · α={alpha:.1f}° · Ncrit={Ncrit:g} · M={M:g}")
+
+        st.markdown("---")
+
+        # ===== 参数：四个一行（尽可能紧凑）=====
+        st.markdown("""
+        <style>
+          /* 紧凑标签与行距 */
+          div[data-testid="stSlider"]>div>label,
+          div[data-testid="stNumberInput"]>label { white-space: nowrap; font-weight: 600; }
+          div[data-testid="stSlider"], div[data-testid="stNumberInput"] { margin-bottom: .42rem; }
+        </style>
+        """, unsafe_allow_html=True)
+        st.markdown("### Parameters")
+
+        # 第1行：几何
+        r1c1, r1c2, r1c3, r1c4 = st.columns(4, gap="small")
+        with r1c1:
+            st.slider("Camber (%)", 0.0, 10.0, st.session_state.get("camber_pct", 2.0), 0.1, key="camber_pct")
+        with r1c2:
+            st.slider("Max camber pos (%)", 0.0, 100.0, st.session_state.get("p_pct", 40.0), 1.0, key="p_pct")
+        with r1c3:
+            st.slider("Thickness (%)", 5.0, 20.0, st.session_state.get("thickness_pct", 12.0), 0.1, key="thickness_pct")
+        with r1c4:
+            st.slider("Max thickness pos (%)", 0.0, 100.0, st.session_state.get("tpos_pct", 30.0), 1.0, key="tpos_pct")
+
+        # 第2行：流体
+        r2c1, r2c2, r2c3, r2c4 = st.columns(4, gap="small")
+        with r2c1:
+            st.number_input("ρ (kg/m³)", value=float(st.session_state.get("rho", 1.225)), key="rho")
+        with r2c2:
+            st.number_input("V (m/s)", value=float(st.session_state.get("V", 10.0)), key="V")
+        with r2c3:
+            st.number_input("Chord c (m)", value=float(st.session_state.get("chord", 1.0)),
+                            min_value=0.05, step=0.05, key="chord")
+        with r2c4:
+            st.number_input("μ (Pa·s)", value=float(st.session_state.get("mu", 1.8e-5)),
+                            format="%.6e", key="mu")
+
+        # 第3行：求解与扫描（把范围滑块也放进一列）
+        r3c1, r3c2, r3c3, r3c4 = st.columns(4, gap="small")
+        with r3c1:
+            st.number_input("Mach", value=float(st.session_state.get("Mach", 0.0)),
+                            min_value=0.0, max_value=0.3, step=0.01, key="Mach")
+        with r3c2:
+            st.number_input("Ncrit", value=float(st.session_state.get("Ncrit", 7.0)),
+                            min_value=1.0, max_value=12.0, step=0.5, key="Ncrit")
+        with r3c3:
+            st.slider("Scan range α (°)", 0.0, 15.0,
+                      st.session_state.get("alpha_range", (0.0, 10.0)), 0.5, key="alpha_range")
+        with r3c4:
+            st.number_input("Δα (°)", value=float(st.session_state.get("alpha_step", 1.0)),
+                            min_value=0.1, max_value=2.0, step=0.1, key="alpha_step")
+
+        # 第4行：当前攻角（补满4列以保持整齐）
+        r4c1, r4c2, r4c3, r4c4 = st.columns(4, gap="small")
+        with r4c1:
+            _alpha_kwargs = dict(min_value=0.0, max_value=15.0, step=0.5, key="alpha_deg")
+            if "alpha_deg" not in st.session_state:
+                _alpha_kwargs["value"] = 5.0
+            st.slider("Current α (°)", **_alpha_kwargs)
+        with r4c2:
+            st.empty()
+        with r4c3:
+            st.empty()
+        with r4c4:
+            st.empty()
 
     # === History Tab ===
     with tab_hist:
@@ -1476,7 +1578,7 @@ with col_main:
                 else:
                     st.info("No saved records yet.")
             except Exception as e:
-                st.warning(f"⚠️ Backend fetch failed: {e}")
+                st.warning(f" Backend fetch failed: {e}")
 
             # 自动刷新完成后关闭标志，下次只有点刷新按钮才会再请求
             st.session_state["refresh_history"] = False
@@ -1494,100 +1596,89 @@ with col_main:
         # === Help Tab ===
         with tab_help:
             st.markdown("## Help Center")
-            st.caption("AI-Enhanced Airfoil Design & Learning Lab — Quick reference and troubleshooting")
+            st.caption("AI-Enhanced Airfoil Design & Learning Lab — Updated quick guide for the current interface")
 
-            st.markdown("### Overview")
+            st.markdown("### What this app does")
             st.markdown("""
-        This web app is an **AI-assisted airfoil design and learning environment** combining:  
-        1) **Geometry preview & parameter controls** (NACA 4-digit),  
-        2) **XFOIL polar analysis** (CL/CD/CM and L/D), and  
-        3) **Role-based tutoring** for concept learning, model iteration, and strategy review.
-        """)
+        This web app combines **NACA geometry preview**, **XFOIL polar analysis** (CL/CD/CM & L/D),
+        and **role-based AI tutoring** for concept learning, model iteration, and strategy review.
+        The interface is organized into a **left Dialogue column** and a **right multi-tab workspace**.
+            """)
 
-            st.markdown("### Quick Start")
+            st.markdown("### Page layout at a glance")
             st.markdown("""
-        1. **Set parameters** in **Geometry & Parameters** (camber `m%`, max camber position `p%`, thickness `t%`, flow & solver settings).  
-        2. Switch to **Performance & Polars** to compute polars and view **CL**, **CD**, **L/D**, and **α\***.  
-        3. In the **Dialogue** (left), pick a role in **🎭 Choose AI Module**, ask a question, or click **📥 Insert Simulation Data** to auto-paste your current settings, then discuss improvements with the AI.  
-        4. Use **History** to view or export saved runs and **Restore historical dialogue** to reload past chats (per user).
-        """)
+        - **Left column — Dialogue**
+          - **🎭 Choose AI Module** (Concept Learning / Model Iteration / Strategy Review)
+          - **Filter modules**, **Search** with **Prev / Next / ⬇️ Latest**
+          - **📜 Restore historical dialogue** (loads your past chat by user)
+          - **Input & Send**; **📥 Insert Simulation Data** auto-pastes current parameters
+        - **Right column — Tabs**
+          - **🧩 Geometry + Performance** (merged): KPIs & polar plots (top), large airfoil preview, then a **4-per-row** parameter grid
+          - **🗂️ History**: fetch, view, and download your saved runs (per user)
+          - **❓ Help**: this guide
+          - **🔑 Admin**: export all conversations/airfoils (requires admin password)
+            """)
 
-            st.markdown("### Page Layout")
+            st.markdown("### Quick start")
             st.markdown("""
-        - **Left column**: Dialogue (role selection, search, history restore, input & send).  
-        - **Right column**: Tabs for **Geometry & Parameters**, **Performance & Polars**, **History**, **Help**, and **Admin** (admin only).
-        """)
+        1. Go to **🧩 Geometry + Performance** and set parameters:
+           - Geometry: camber **m%**, max-camber position **p%**, thickness **t%**, (optional) max-thickness position.
+           - Flow: **ρ, V, chord c, μ**; the app computes **Re = ρVc/μ**.
+           - Solver: **Mach**, **Ncrit** (typ. 5–9).
+           - Scan: **α range** and **Δα** for ASEQ.
+        2. The top area shows **KPIs** (CL, CD, L/D, best α\*) and three compact plots:
+           **CL vs α**, **CD vs α**, **L/D vs α** with markers at current **α** and **α\***.
+        3. Scroll down to **Airfoil Preview** for a large NACA outline (equal-axis plot).
+        4. Use the **Parameters** grid (4 controls per row) to iterate quickly.
+        5. On the left, pick a role in **🎭 Choose AI Module**.  
+           Ask a question or click **📥 Insert Simulation Data** to paste the current setup and request feedback.
+        6. Save a run with **💾 Save this result** and review it later in **🗂️ History** (you can download CSV).
+            """)
 
-            with st.expander("AI Roles (when to use which)"):
+            with st.expander("AI roles — when to use which"):
                 st.markdown("""
-        - **Concept Learning** — Clarify core concepts (e.g., lift coefficient, stall, Reynolds number). Use a **guiding** tone, ask probing questions.  
-        - **Model Iteration** — Plan experiments, scan parameters (α range/step, Re, Ncrit) and compare outcomes.  
-        - **Strategy Review** — Critically evaluate your approach (claim–evidence–warrant), surface gaps and next steps.
-        """)
+        - **Concept Learning** — Clarifies core concepts (lift, stall, Reynolds number, etc.) with guiding questions.  
+        - **Model Iteration** — Designs reproducible parameter scans, compares outcomes, and suggests next tweaks.  
+        - **Strategy Review** — Critiques your claim–evidence–warrant chain and proposes actionable next steps.
+                """)
 
-            with st.expander("Geometry & Parameters (what each control means)"):
+            with st.expander("Reading the Performance section"):
                 st.markdown("""
-        - **NACA 4-digit** (`mpt` → `m%`, `p/10`, `t%`): `m` camber, `p` chordwise location of max camber, `t` thickness.  
-        - **Flow**: ρ (density), **V** (velocity), **c** (chord), **μ** (dynamic viscosity). Reynolds number `Re = ρVc/μ`.  
-        - **Solver**: **Mach** (typically ≤ 0.3 for incompressible assumptions), **Ncrit** (transition criterion, e.g., 5–9 for typical wind-tunnel atmospheres).  
-        - **Scan**: α range `[α_min, α_max]` and step `Δα` for **ASEQ** scanning; use a smaller `Δα` for finer L/D peaks.
-        """)
+        - **KPIs**: CL, CD, **L/D**, and **α\*** (the peak **L/D** in the scanned α range).  
+        - **Plots**: three tabs (**CL vs α**, **CD vs α**, **L/D vs α**). Vertical lines mark the **current α** and **α\***.  
+        - If XFOIL fails to return valid polars, the app shows a **fallback simulated curve** so the UI remains usable—adjust inputs and recompute.
+                """)
 
-            with st.expander("Performance & Polars (how to read the plots)"):
+            with st.expander("Parameter tips"):
                 st.markdown("""
-        - **CL(α)**, **CD(α)**, **CM(α)** are computed from XFOIL polars.  
-        - **L/D** helps locate efficient angles; the app highlights **α\*** where L/D is maximal in the scanned range.  
-        - If XFOIL returns no valid data, the app will show a **simulated fallback** curve (for UI continuity). Prefer fixing inputs to get physical results.
-        """)
+        - Start with moderate geometry (e.g., **m** 2–3%, **t** 12%) and scan **α = 0°–10°**, **Δα = 0.5°–1°**.  
+        - Keep **Mach ≤ 0.3** for incompressible assumptions.  
+        - Try **Ncrit ≈ 7** first; move ±2 if convergence is poor.  
+        - Extreme shapes or very small **Re** can cause non-physical results or empty polars.
+                """)
 
-            with st.expander("Dialogue & Data (good practices)"):
+            with st.expander("Dialogue good practices"):
                 st.markdown("""
-        - Use **📥 Insert Simulation Data** to paste the current setup into the chat, then ask the AI to critique or suggest iterations.  
-        - Phrase prompts for **reasoning**, e.g., *“If I increase `t%` while keeping `Re` fixed, what trade-offs appear in stall and L/D?”*  
-        - **History** tab: inspect, refresh, and export your saved runs (CSV). **Admin** can export all users’ data.
-        """)
+        - Use **📥 Insert Simulation Data** before asking for design advice—this gives the AI full context.  
+        - Prefer “reasoning” prompts, e.g., *“If I increase **t%** at fixed **Re**, what happens to stall and **L/D**?”*  
+        - For argumentation, structure notes as **Claim → Evidence → Warrant**; add **Qualifiers/Rebuttals** when needed.  
+        - Toggle **✂️ Concise mode** if you want shorter, more to-the-point answers.  
+          > Internal guidance when enabled: “Reply more concisely and ask fewer but precise questions.”
+                """)
 
-            st.markdown("### Methodological Guidance")
+            st.markdown("### Troubleshooting")
             st.markdown("""
-        - Treat the AI as a **Socratic partner**: ask “why/how” questions, test hypotheses, and compare runs under controlled changes.  
-        - For argumentation, structure your notes as **Claim–Evidence–Warrant** (and add Qualifiers/Rebuttals when applicable).  
-        - Keep **Re**, **α range**, **Δα**, **Ncrit** explicit in your lab notes to ensure **reproducibility**.
-        """)
+        - **No polar or empty `polar.out`** → Check α range/Δα, **Re** magnitude, and **Ncrit**; ensure `xfoil.exe` exists in the app root (Windows).  
+        - **L/D = NaN or odd** → Often due to **CD ≈ 0** or sparse samples; reduce **Δα** and/or widen α range.  
+        - **Port already in use (8000/8501)** → Stop the process using that port (Windows: Task Manager or `netstat` + `taskkill`).  
+        - **Input not clearing** → The app rotates the input widget key after submission; refresh if local state drifts.
+            """)
 
-            st.markdown("### FAQ")
+            st.markdown("### Data & ethics")
             st.markdown("""
-        **Q1. My input remains in the box after sending.**  
-        The app clears after submission; if you still see text, refresh the page to resync the widget state.
-
-        **Q2. XFOIL returns no polar or `polar.out` is empty.**  
-        Check α range/step and `Re` magnitude; try moderate **Ncrit** (e.g., 7) and ensure `xfoil.exe` exists in the app root on Windows. If geometry is extreme (very high camber/thickness or tiny `Re`), start with gentler values.
-
-        **Q3. L/D looks strange or NaN.**  
-        This occurs if **CD ≈ 0** or data is sparse. Reduce `Δα`, widen the scan, or adjust `Re`/`Ncrit` for a stable polar.
-
-        **Q4. “Address already in use” on port 8000/8501.**  
-        Stop previous processes using those ports (Windows: Task Manager or `netstat` + `taskkill`; Linux/macOS: `lsof -i :PORT` then `kill -9 PID`).
-        """)
-
-            st.markdown("### Troubleshooting Checklist")
-            st.markdown("""
-        - ✅ **Executable**: On Windows, ensure **`xfoil.exe`** is in the project root.  
-        - ✅ **Ranges**: Use reasonable **α** ranges (e.g., 0°–10°) and `Δα` (0.5°–1°) to start.  
-        - ✅ **Reynolds**: Verify `Re = ρVc/μ` is not pathologically small/large for your case.  
-        - ✅ **Ncrit**: Start near 7; move ±2 if convergence is poor.  
-        - ✅ **Fallback**: If you see a fallback curve, it means no valid XFOIL data—adjust inputs and recompute.
-        """)
-
-            st.markdown("### Notes on Ethics & Data")
-            st.markdown("""
-        - Use the system for **learning and research**; cite results appropriately in coursework or publications.  
-        - Dialogue logs and run data may be stored for analysis; anonymize when required by your IRB/ethics policy.
-        """)
-
-            st.info("This Help is adapted from your uploaded quick-guide and refined for clarity and research use. "
-                    "For classroom deployment, you may extend with course-specific rubrics and examples. "
-                    "Source: internal guide. "
-                    ":contentReference[oaicite:0]{index=0}")
+        Use this app for learning and research. If you publish or submit coursework, cite your methods and parameters.
+        Dialogue logs and run data may be stored for research; anonymize as required by your local IRB/ethics policy.
+            """)
 
     # === Admin Panel ===
     with tab_admin:
@@ -1609,9 +1700,9 @@ with col_main:
                             use_container_width=True
                         )
                     else:
-                        st.error(f"❌ Failed: {resp.text}")
+                        st.error(f" Failed: {resp.text}")
                 except Exception as e:
-                    st.error(f"⚠️ Error fetching conversations: {e}")
+                    st.error(f" Error fetching conversations: {e}")
 
             # Airfoils
             if st.button("📥 Download All Airfoils (CSV)", use_container_width=True):
@@ -1627,8 +1718,8 @@ with col_main:
                             use_container_width=True
                         )
                     else:
-                        st.error(f"❌ Failed: {resp.text}")
+                        st.error(f" Failed: {resp.text}")
                 except Exception as e:
-                    st.error(f"⚠️ Error fetching airfoils: {e}")
+                    st.error(f" Error fetching airfoils: {e}")
         else:
             st.warning("Enter the correct admin password to access this panel.")
