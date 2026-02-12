@@ -1,0 +1,18 @@
+# Fine-tuning Dependencies
+# Install with: pip install -r fine_tuning/requirements.txt
+
+# OpenAI Fine-tuning
+openai>=1.0.0
+
+# Local Fine-tuning (Unsloth - recommended for consumer GPUs)
+# unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git
+# torch>=2.0.0
+# transformers>=4.36.0
+# peft>=0.7.0
+# trl>=0.7.0
+# datasets>=2.16.0
+# bitsandbytes>=0.42.0
+
+# Data Processing
+pandas>=2.0.0
+tiktoken>=0.5.0

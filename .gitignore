@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+.env
+
+# Logs
+*.log
+backend.log
+
+# Database
+moment_knowledge.db
+aero_data.db
+
+# VS Code / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Mac
+.DS_Store
+
+# React / Node
+node_modules/
+.next/
+out/
+build/
+dist/
+
+# System
+Thumbs.db
