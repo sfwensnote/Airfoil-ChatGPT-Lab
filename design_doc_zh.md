@@ -86,6 +86,37 @@ graph TD
 - **`src/components/history/HistoryPanel.tsx`**: 历史记录面板，展示过往设计并支持回溯。
 
 ## 5. 待优化项 (Future Improvements)
-- [ ] 支持 NACA 5位数 / 6位数翼型。
-- [ ] 引入 WebAssembly (Wasm) 版 XFOIL 以实现纯前端精确计算。
 - [ ] 增加多点优化 (Multi-point Optimization) 功能。
+
+## 6. 大模型与智能体 (Large Model & Agents)
+
+本项目集成了一个基于 **LangGraph** 的多智能体系统，用于辅助用户进行翼型设计与学习。
+
+### 6.1 智能体架构 (Agent Architecture)
+
+- **框架**: LangChain + LangGraph (StateGraph)
+- **模型**: Qwen 2.5 / GPT-4o-mini (通过 OpenAI 兼容接口调用)
+- **RAG (检索增强生成)**: 
+  - 向量数据库: Chroma
+  - Embedding: HuggingFace (`all-MiniLM-L6-v2`)
+
+#### 智能体角色 (Roles)
+1.  **Router (路由)**: 分析用户意图，分发给特定智能体。
+2.  **Concept Mentor (概念导师)**: 解答空气动力学概念问题 (RAG 增强)。
+3.  **Iteration Engineer (迭代工程师)**: 根据当前翼型几何与性能数据，提供优化建议。
+4.  **Strategy Analyst (策略分析师)**: 分析用户的设计历史轨迹，总结规律。
+
+### 6.2 模型微调 (Fine-tuning)
+
+为了提升模型在特定领域的表现，本项目提供了本地微调方案。
+
+- **库**: **Unsloth** (加速训练) + **TRL** (SFTTrainer) + **PEFT**
+- **方法**: **QLoRA** (4-bit 量化 + LoRA 适配器)
+- **基座模型**: `unsloth/Qwen2.5-7B-Instruct-bnb-4bit`
+- **训练数据**: JSON 格式 (Alpaca 或 ShareGPT 格式)
+- **关键参数**:
+  - `lora_r`: 16
+  - `max_seq_length`: 2048
+  - `load_in_4bit`: True
+
+可通过 `fine_tuning/scripts/local_lora_train.py` 进行本地训练。
