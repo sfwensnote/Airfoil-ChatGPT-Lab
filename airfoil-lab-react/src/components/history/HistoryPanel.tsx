@@ -122,9 +122,9 @@ export function HistoryPanel() {
                         </p>
                     </div>
 
-                    <div className="overflow-x-auto rounded-lg border border-[hsl(220,15%,22%)]">
+                    <div className="overflow-auto rounded-lg border border-[hsl(220,15%,22%)] max-h-[480px]">
                         <table className="min-w-full text-sm">
-                            <thead className="bg-[hsl(220,15%,18%)]">
+                            <thead className="bg-[hsl(220,15%,18%)] sticky top-0 z-10">
                                 <tr>
                                     <th className="px-4 py-3 text-left text-slate-300 font-medium">NACA</th>
                                     <th className="px-4 py-3 text-left text-slate-300 font-medium">Camber</th>
