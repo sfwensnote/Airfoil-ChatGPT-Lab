@@ -9,6 +9,7 @@ import {
     Tooltip,
     Legend,
     ResponsiveContainer,
+    Brush,
 } from 'recharts';
 import { AirfoilHistory } from '@/types';
 
@@ -39,8 +40,10 @@ export function HistoryChart({ data, className = '' }: HistoryChartProps) {
         timestamp: new Date(item.timestamp).toLocaleString(),
     }));
 
-    // Minimum width for horizontal scrollability
-    const minWidth = Math.max(600, chartData.length * 70);
+    // Show last N points by default in the Brush window
+    const defaultWindow = 15;
+    const startIdx = Math.max(0, chartData.length - defaultWindow);
+    const endIdx = chartData.length - 1;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const CustomTooltip = ({ active, payload }: any) => {
@@ -62,64 +65,74 @@ export function HistoryChart({ data, className = '' }: HistoryChartProps) {
 
     return (
         <div className={className}>
-            <div className="overflow-x-auto pb-2 -mx-1 px-1" style={{ scrollbarWidth: 'thin' }}>
-                <div style={{ minWidth: `${minWidth}px`, height: 220 }}>
-                    <ResponsiveContainer width="100%" height="100%">
-                        <LineChart data={chartData} margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
-                            <CartesianGrid strokeDasharray="3 3" stroke="rgba(148,163,184,0.1)" />
-                            <XAxis
+            <div style={{ width: '100%', height: 280 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={chartData} margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="rgba(148,163,184,0.1)" />
+                        <XAxis
+                            dataKey="idx"
+                            tick={darkAxisStyle}
+                            label={{ value: 'Iteration', position: 'insideBottomRight', offset: -5, fill: '#94a3b8', fontSize: 11 }}
+                        />
+                        <YAxis
+                            yAxisId="left"
+                            tick={darkAxisStyle}
+                            label={{ value: 'L/D Max', angle: -90, position: 'insideLeft', offset: 10, fill: '#94a3b8', fontSize: 11 }}
+                        />
+                        <YAxis
+                            yAxisId="right"
+                            orientation="right"
+                            tick={darkAxisStyle}
+                            label={{ value: 'CL / CD×10³', angle: 90, position: 'insideRight', offset: 10, fill: '#94a3b8', fontSize: 11 }}
+                        />
+                        <Tooltip content={<CustomTooltip />} />
+                        <Legend
+                            wrapperStyle={{ fontSize: 11, color: '#94a3b8' }}
+                        />
+                        <Line
+                            yAxisId="left"
+                            type="monotone"
+                            dataKey="ldMax"
+                            stroke="#34d399"
+                            strokeWidth={2}
+                            dot={{ fill: '#34d399', r: 3 }}
+                            activeDot={{ r: 5 }}
+                            name="L/D Max"
+                        />
+                        <Line
+                            yAxisId="right"
+                            type="monotone"
+                            dataKey="cl"
+                            stroke="#60a5fa"
+                            strokeWidth={2}
+                            dot={{ fill: '#60a5fa', r: 3 }}
+                            activeDot={{ r: 5 }}
+                            name="CL"
+                        />
+                        <Line
+                            yAxisId="right"
+                            type="monotone"
+                            dataKey="cd"
+                            stroke="#f87171"
+                            strokeWidth={2}
+                            dot={{ fill: '#f87171', r: 3 }}
+                            activeDot={{ r: 5 }}
+                            name="CD ×10³"
+                        />
+                        {chartData.length > defaultWindow && (
+                            <Brush
                                 dataKey="idx"
-                                tick={darkAxisStyle}
-                                label={{ value: 'Iteration', position: 'insideBottomRight', offset: -5, fill: '#94a3b8', fontSize: 11 }}
+                                height={24}
+                                stroke="#475569"
+                                fill="hsl(220,20%,12%)"
+                                travellerWidth={8}
+                                startIndex={startIdx}
+                                endIndex={endIdx}
+                                tickFormatter={() => ''}
                             />
-                            <YAxis
-                                yAxisId="left"
-                                tick={darkAxisStyle}
-                                label={{ value: 'L/D Max', angle: -90, position: 'insideLeft', offset: 10, fill: '#94a3b8', fontSize: 11 }}
-                            />
-                            <YAxis
-                                yAxisId="right"
-                                orientation="right"
-                                tick={darkAxisStyle}
-                                label={{ value: 'CL / CD×10³', angle: 90, position: 'insideRight', offset: 10, fill: '#94a3b8', fontSize: 11 }}
-                            />
-                            <Tooltip content={<CustomTooltip />} />
-                            <Legend
-                                wrapperStyle={{ fontSize: 11, color: '#94a3b8' }}
-                            />
-                            <Line
-                                yAxisId="left"
-                                type="monotone"
-                                dataKey="ldMax"
-                                stroke="#34d399"
-                                strokeWidth={2}
-                                dot={{ fill: '#34d399', r: 3 }}
-                                activeDot={{ r: 5 }}
-                                name="L/D Max"
-                            />
-                            <Line
-                                yAxisId="right"
-                                type="monotone"
-                                dataKey="cl"
-                                stroke="#60a5fa"
-                                strokeWidth={2}
-                                dot={{ fill: '#60a5fa', r: 3 }}
-                                activeDot={{ r: 5 }}
-                                name="CL"
-                            />
-                            <Line
-                                yAxisId="right"
-                                type="monotone"
-                                dataKey="cd"
-                                stroke="#f87171"
-                                strokeWidth={2}
-                                dot={{ fill: '#f87171', r: 3 }}
-                                activeDot={{ r: 5 }}
-                                name="CD ×10³"
-                            />
-                        </LineChart>
-                    </ResponsiveContainer>
-                </div>
+                        )}
+                    </LineChart>
+                </ResponsiveContainer>
             </div>
         </div>
     );
