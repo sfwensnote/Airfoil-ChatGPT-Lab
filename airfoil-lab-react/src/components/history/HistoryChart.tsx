@@ -37,6 +37,10 @@ export function HistoryChart({ data, className = '' }: HistoryChartProps) {
         cl: item.cl ? parseFloat(item.cl.toFixed(4)) : 0,
         cd: item.cd ? parseFloat((item.cd * 1000).toFixed(2)) : 0, // Scale CD ×1000 for readability
         alpha: item.alpha,
+        camber: item.camber,
+        thickness: item.thickness,
+        maxCamberPos: item.maxCamberPos,
+        maxThicknessPos: item.maxThicknessPos,
         timestamp: new Date(item.timestamp).toLocaleString(),
     }));
 
@@ -53,6 +57,12 @@ export function HistoryChart({ data, className = '' }: HistoryChartProps) {
             <div className="bg-[hsl(220,20%,14%)] border border-[hsl(220,15%,25%)] rounded-lg px-3 py-2 shadow-xl text-xs space-y-1">
                 <p className="text-white font-semibold">NACA {d?.nacaCode}</p>
                 <p className="text-slate-400">#{d?.idx} · α = {d?.alpha}°</p>
+                <div className="border-t border-slate-700 my-1 pt-1">
+                    <p className="text-slate-300">Camber: <span className="text-white">{d?.camber}%</span></p>
+                    <p className="text-slate-300">Thickness: <span className="text-white">{d?.thickness}%</span></p>
+                    <p className="text-slate-300">Max Camber Pos: <span className="text-white">{d?.maxCamberPos}%</span></p>
+                    <p className="text-slate-300">Max Thick Pos: <span className="text-white">{d?.maxThicknessPos}%</span></p>
+                </div>
                 {payload.map((entry: { name: string; value: number; color: string }, i: number) => (
                     <p key={i} style={{ color: entry.color }}>
                         {entry.name}: {entry.value}
