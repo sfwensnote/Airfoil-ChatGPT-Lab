@@ -32,16 +32,17 @@ class AgentState(TypedDict):
 
 # ============= Helper Functions =============
 
-# 自定义 API 配置
-CUSTOM_API_BASE = "http://49.51.37.239:3006/v1"
-CUSTOM_API_KEY = "sk-VrwOEEFLgjJwSOjH5pHRTDorgf0SmJVQrjK2D1uyjxZcfsrn"
+# 自定义 API 配置 (已替换为本地 MLX Server)
+CUSTOM_API_BASE = "http://127.0.0.1:8080/v1"
+CUSTOM_API_KEY = "mlx-local"
 
 
-def create_llm(model: str = "gpt-4o-mini", temperature: float = 0.7) -> ChatOpenAI:
+def create_llm(model: str = "/Users/wensifan/bot-remote-windows/fine_tuning/outputs/mlx-fused", temperature: float = 0.7) -> ChatOpenAI:
     """Create a ChatOpenAI instance with custom API endpoint."""
     return ChatOpenAI(
         model=model,
         temperature=temperature,
+        max_tokens=2048,  # 设置较大的最大 token 数，防止回答被截断
         openai_api_key=CUSTOM_API_KEY,
         openai_api_base=CUSTOM_API_BASE,
     )

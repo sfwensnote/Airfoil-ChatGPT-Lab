@@ -19,6 +19,16 @@ if ! command -v npm &> /dev/null; then
     exit 1
 fi
 
+# 启动 MLX Server
+echo "🧠 Starting MLX Server (port 8080)..."
+cd "$SCRIPT_DIR"
+PATH=/Library/Frameworks/Python.framework/Versions/3.10/bin:$PATH python3 -m mlx_lm.server --model "$SCRIPT_DIR/fine_tuning/outputs/mlx-fused" --port 8080 > "$SCRIPT_DIR/mlx_server.log" 2>&1 &
+MLX_PID=$!
+echo "   MLX Server PID: $MLX_PID"
+
+# 等待 MLX Server 启动
+sleep 5
+
 # 启动后端
 echo "📡 Starting backend (port 8000)..."
 cd "$SCRIPT_DIR"
@@ -47,7 +57,7 @@ echo ""
 echo "Press Ctrl+C to stop both services..."
 
 # 捕获退出信号
-trap "echo ''; echo '🛑 Stopping services...'; kill $BACKEND_PID $FRONTEND_PID 2>/dev/null; exit 0" SIGINT SIGTERM
+trap "echo ''; echo '🛑 Stopping services...'; kill $BACKEND_PID $FRONTEND_PID $MLX_PID 2>/dev/null; exit 0" SIGINT SIGTERM
 
 # 保持脚本运行
 wait

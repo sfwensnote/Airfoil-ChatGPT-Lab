@@ -12,7 +12,7 @@ import {
 } from "@/components/ui/tooltip";
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { useChatStore, useSimulationStore, useUserStore } from '@/stores';
-import { ChatMessage } from '@/types';
+import { ChatMessage, GeometryParams } from '@/types';
 import { getConversationHistory, saveConversation, chatWithAgent, deleteConversationHistory } from '@/lib/api';
 import { v4 as uuidv4 } from 'uuid';
 import ReactMarkdown from 'react-markdown';
@@ -68,7 +68,7 @@ export function ChatWindow({ className = '' }: { className?: string }) {
         loadHistory
     } = useChatStore();
 
-    const { geometry, environment, result } = useSimulationStore();
+    const { geometry, environment, result, setGeometry } = useSimulationStore();
     const { currentUser } = useUserStore();
     const userId = currentUser ? currentUser.username : 'guest';
 
@@ -242,12 +242,14 @@ export function ChatWindow({ className = '' }: { className?: string }) {
         return found?.color || 'bg-white/5 text-slate-300';
     };
 
-    // Preprocess content to replace \[ \] with $$ $$ and \( \) with $ $
     const preprocessContent = (content: string) => {
         if (!content) return '';
         return content
             .replace(/\\\[([\s\S]*?)\\\]/g, '$$$$$1$$$$') // Replace \[ ... \] with $$ ... $$
-            .replace(/\\\(([\s\S]*?)\\\)/g, '$$$1$$');     // Replace \( ... \) with $ ... $
+            .replace(/\\\(([\s\S]*?)\\\)/g, '$$$1$$')     // Replace \( ... \) with $ ... $
+            .replace(/<thought>([\s\S]*?)(?:<\/thought>|$)/g, (match, p1) => {
+                return '> **🤔 AI 思考过程**\n>\n' + p1.split('\n').map((line: string) => `> ${line}`).join('\n') + '\n\n';
+            });
     };
 
     return (
@@ -378,20 +380,50 @@ export function ChatWindow({ className = '' }: { className?: string }) {
                                             const match = /language-(\w+)/.exec(className || '');
                                             const isInline = !match && !String(children).includes('\n');
 
-                                            // Ensure JSON is highlighted even if language-json isn't explicitly set but detected
-                                            // (though remark-gfm usually handles this if fenced properly)
+                                            // Check if it's JSON from the Iteration Engineer
+                                            const codeString = String(children);
+                                            let isParameterJson = false;
+                                            let parsedParams: Partial<GeometryParams> | null = null;
+
+                                            if (!isInline && match?.[1] === 'json') {
+                                                try {
+                                                    const parsed = JSON.parse(codeString);
+                                                    if ('camber' in parsed || 'thickness' in parsed || 'maxCamberPos' in parsed) {
+                                                        isParameterJson = true;
+                                                        parsedParams = parsed;
+                                                    }
+                                                } catch (e) {
+                                                    // Not a valid JSON or doesn't match our schema
+                                                }
+                                            }
 
                                             return isInline ? (
                                                 <code className="bg-white/10 px-1 py-0.5 rounded text-xs font-mono text-slate-200" {...props}>
                                                     {children}
                                                 </code>
                                             ) : (
-                                                <div className="my-2 rounded-md overflow-hidden bg-black/30 text-slate-200">
-                                                    <div className="px-3 py-1 bg-black/20 text-[10px] text-slate-500 font-mono border-b border-white/5 flex justify-between">
-                                                        <span>{match?.[1] || 'code'}</span>
+                                                <div className="my-2 rounded-md overflow-hidden bg-black/30 text-slate-200 border border-white/10">
+                                                    <div className="px-3 py-2 bg-black/20 text-xs text-slate-400 font-mono flex items-center justify-between border-b border-white/5">
+                                                        <span className="flex items-center gap-2">
+                                                            <div className="w-2 h-2 rounded-full bg-slate-600"></div>
+                                                            {isParameterJson ? 'Suggested Parameters' : (match?.[1] || 'code')}
+                                                        </span>
+                                                        {isParameterJson && parsedParams && (
+                                                            <Button
+                                                                size="sm"
+                                                                variant="default"
+                                                                className="h-6 text-[10px] px-2 bg-amber-600 hover:bg-amber-500 text-white"
+                                                                onClick={() => {
+                                                                    if (parsedParams) setGeometry(parsedParams);
+                                                                }}
+                                                            >
+                                                                <Target className="w-3 h-3 mr-1" />
+                                                                Apply to Airfoil
+                                                            </Button>
+                                                        )}
                                                     </div>
                                                     <div className="p-3 overflow-x-auto">
-                                                        <code className={`text-xs font-mono ${className || ''}`} {...props}>
+                                                        <code className={`text-xs font-mono leading-relaxed ${className || ''}`} {...props}>
                                                             {children}
                                                         </code>
                                                     </div>

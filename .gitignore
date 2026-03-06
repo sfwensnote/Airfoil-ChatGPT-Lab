@@ -32,3 +32,16 @@ dist/
 
 # System
 Thumbs.db
+# Large binaries and models
+Ollama-darwin.zip
+Ollama.app/
+*.gguf
+*.bin
+fine_tuning/outputs/
+
+# Keep data folder structure but ignore large files
+fine_tuning/data/mlx/
+
+# Temporary files
+*.tmp
+*.temp

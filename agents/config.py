@@ -18,8 +18,7 @@ class AgentConfig:
     display_name: str
     system_prompt: str
     temperature: float = 0.7
-    model: str = "gpt-4o-mini"
-
+    model: str = "/Users/wensifan/bot-remote-windows/fine_tuning/outputs/mlx-fused"
 
 # ============= 概念学习导师 (Concept Mentor) =============
 CONCEPT_MENTOR_PROMPT = """你是一位专家级的空气动力学教育者，专门帮助学生理解翼型设计的基础理论。
